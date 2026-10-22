@@ -1,0 +1,87 @@
+# DomainManager – Cloudflare DNS / DDNS dashboard with local AI security check.
+# Setup: see README.md. All values come from .env and ./secrets/.
+
+x-hardening: &hardening
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options: { max-size: "5m", max-file: "3" }
+
+services:
+  dashboard:
+    <<: *hardening
+    build: ./dashboard
+    image: domainmanager-dashboard:local
+    ports:
+      # Default only on localhost. For LAN access set BIND_ADDR to the server's LAN IP.
+      - "${BIND_ADDR:-127.0.0.1}:${PORT:-8443}:8443"
+    environment:
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD_HASH_FILE: /run/secrets/admin_password_hash
+      TOTP_SECRET_FILE: /run/secrets/totp_secret
+      CF_API_TOKEN_FILE: /run/secrets/cf_api_token
+      OLLAMA_URL: ${OLLAMA_URL:?OLLAMA_URL in .env setzen}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-8192}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-2m}
+      OLLAMA_MAX_MODEL_GB: ${OLLAMA_MAX_MODEL_GB:-10}
+      DDNS_ENV_FILE: /ddns/ddns.env
+      DDNS_DOMAIN_KEYS: ${DDNS_DOMAIN_KEYS:-DOMAINS,IP4_DOMAINS,IP6_DOMAINS}
+      APPLIER_ENABLED: ${APPLIER_ENABLED:-true}
+      ALLOW_DNS_DELETE: ${ALLOW_DNS_DELETE:-false}
+      ALLOWED_NETWORKS: ${ALLOWED_NETWORKS:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}
+      TLS_MODE: ${TLS_MODE:-selfsigned}
+      TLS_HOSTNAMES: ${TLS_HOSTNAMES:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-true}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
+      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-30}
+      SESSION_MAX_HOURS: ${SESSION_MAX_HOURS:-8}
+    secrets: [admin_password_hash, totp_secret, cf_api_token]
+    volumes:
+      - dm-data:/data
+      - applier:/applier
+      # Only the "managed" sub-folder of the DDNS project – never its docker-compose.yml.
+      - ${DDNS_PROJECT_DIR:?DDNS_PROJECT_DIR in .env setzen}/managed:/ddns
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    mem_limit: 256m
+    cpus: 1.0
+    pids_limit: 128
+
+  applier:
+    <<: *hardening
+    build: ./applier
+    image: domainmanager-applier:local
+    # No network at all: it only talks to the local Docker socket.
+    network_mode: none
+    environment:
+      DDNS_PROJECT_DIR: ${DDNS_PROJECT_DIR}
+      DDNS_SERVICE: ${DDNS_SERVICE:-cloudflare-ddns}
+      DDNS_PROJECT_NAME: ${DDNS_PROJECT_NAME:-}
+      DOCKER_CONFIG: /tmp/docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - applier:/applier
+      # Same absolute path as on the host, so compose resolves relative paths correctly.
+      - ${DDNS_PROJECT_DIR}:${DDNS_PROJECT_DIR}:ro
+    tmpfs:
+      - /tmp:size=8m,mode=1777,noexec,nosuid
+    mem_limit: 128m
+    pids_limit: 64
+
+secrets:
+  admin_password_hash:
+    file: ./secrets/admin_password_hash
+  totp_secret:
+    file: ./secrets/totp_secret
+  cf_api_token:
+    file: ./secrets/cf_api_token
+
+volumes:
+  dm-data:
+  applier:
