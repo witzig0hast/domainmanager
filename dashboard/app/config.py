@@ -62,14 +62,10 @@ class Settings:
     ollama_keep_alive: str = field(default_factory=lambda: _env("OLLAMA_KEEP_ALIVE", "2m"))
     ollama_max_model_gb: float = field(default_factory=lambda: float(_env("OLLAMA_MAX_MODEL_GB", "10")))
 
-    ddns_env_file: Path = field(default_factory=lambda: Path(_env("DDNS_ENV_FILE", "/ddns/ddns.env")))
-    ddns_domain_keys: tuple[str, ...] = field(
-        default_factory=lambda: tuple(
-            k.strip() for k in _env("DDNS_DOMAIN_KEYS", "DOMAINS,IP4_DOMAINS,IP6_DOMAINS").split(",") if k.strip()
-        )
-    )
-    applier_dir: Path = field(default_factory=lambda: Path(_env("APPLIER_DIR", "/applier")))
-    applier_enabled: bool = field(default_factory=lambda: _bool("APPLIER_ENABLED", True))
+    ddns_interval: int = field(default_factory=lambda: max(60, _int("DDNS_INTERVAL", 300)))
+    ddns_ipv6: bool = field(default_factory=lambda: _bool("DDNS_IPV6", False))
+    import_dir: Path = field(default_factory=lambda: Path(_env("IMPORT_DIR", "/import")))
+    notify_url: str = field(default_factory=lambda: _secret("NOTIFY_URL"))
 
     allow_dns_delete: bool = field(default_factory=lambda: _bool("ALLOW_DNS_DELETE", False))
     allowed_networks: list = field(default_factory=lambda: _networks(_env("ALLOWED_NETWORKS", DEFAULT_ALLOWED)))

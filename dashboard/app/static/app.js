@@ -54,6 +54,16 @@ function cloud(on) {
   svg.innerHTML = '<path d="M50 14.5A14 14 0 0 0 23 9.6 10.8 10.8 0 0 0 6.5 19.5 9.8 9.8 0 0 0 16.3 31h33a8.3 8.3 0 0 0 .7-16.5z"/>';
   return h("span", { class: "proxy " + (on ? "on" : "off") }, svg, on ? "Proxied" : "Nur DNS");
 }
+// A cloud that toggles the proxy status on click, like in the Cloudflare dashboard.
+function proxyButton(on, onToggle, disabled = false) {
+  const btn = h("button", { class: "proxy-btn", type: "button", disabled,
+    title: on ? "Klicken: nur DNS (IP öffentlich sichtbar)" : "Klicken: über Cloudflare proxien" }, cloud(on));
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try { await onToggle(!on); } catch (e) { toast(e.message, "error"); } finally { btn.disabled = false; }
+  });
+  return btn;
+}
 const SEV_LABEL = { critical: "Kritisch", high: "Hoch", medium: "Mittel", low: "Niedrig", info: "Info", ok: "OK" };
 const sevBadge = (s) => h("span", { class: "badge sev-" + s }, SEV_LABEL[s] || s);
 const fmtTime = (ts) => new Date(ts * 1000).toLocaleString("de-DE");
@@ -90,7 +100,7 @@ function toast(msg, kind = "") {
   setTimeout(() => t.remove(), kind === "error" ? 7000 : 4000);
 }
 
-function modal({ title, body, confirmText = "OK", danger = false, onConfirm }) {
+function modal({ title, body, confirmText = "OK", danger = false, wide = false, onConfirm }) {
   const close = () => ov.remove();
   const btn = h("button", { class: "btn " + (danger ? "danger solid" : "primary") }, confirmText);
   btn.addEventListener("click", async () => {
@@ -98,13 +108,14 @@ function modal({ title, body, confirmText = "OK", danger = false, onConfirm }) {
     try { if ((await onConfirm()) !== false) close(); } catch (e) { toast(e.message, "error"); } finally { btn.disabled = false; }
   });
   const ov = h("div", { class: "overlay", onclick: (e) => { if (e.target === ov) close(); } },
-    h("div", { class: "modal", role: "dialog", "aria-modal": "true" },
+    h("div", { class: "modal" + (wide ? " wide" : ""), role: "dialog", "aria-modal": "true" },
       h("div", { class: "card-head" }, h("h2", {}, title)),
       h("div", { class: "card-body" }, body),
       h("div", { class: "card-foot" }, h("span", { class: "spacer" }), h("button", { class: "btn", onclick: close }, "Abbrechen"), btn)));
   document.body.append(ov);
   const first = ov.querySelector("input");
   (first || btn).focus();
+  return { close, button: btn };
 }
 
 function errorBox(e) { return h("div", { class: "alert error" }, h("div", {}, h("b", {}, "Fehler"), e.message || String(e))); }
@@ -152,7 +163,7 @@ function renderLogin(notice) {
 const NAV = [
   ["overview", "Übersicht", "home"],
   ["dns", "DNS-Einträge", "dns"],
-  ["ddns", "DDNS-Domains", "ddns"],
+  ["ddns", "DDNS", "ddns"],
   ["scan", "Sicherheitscheck", "shield"],
   ["audit", "Audit-Log", "list"],
 ];
@@ -208,15 +219,16 @@ async function viewOverview(page) {
   const st = await api("/api/status");
   const stat = (label, ok, value, hint) => h("div", { class: "stat" }, h("div", { class: "label" }, label),
     h("div", { class: "value" }, h("span", { class: "dot " + ok }), value), h("div", { class: "hint" }, hint));
-  const cfS = st.cloudflare, ol = st.ollama, dd = st.ddns, ap = st.applier;
+  const cfS = st.cloudflare, ol = st.ollama, dd = st.ddns;
+  const ipText = ["4", "6"].map((v) => dd.ip[v] ? `IPv${v} ${dd.ip[v]}` : null).filter(Boolean).join(" · ");
   const cards = h("div", { class: "grid" },
     stat("Cloudflare API", cfS.ok ? "ok" : "bad", cfS.ok ? "Verbunden" : "Fehler",
       cfS.ok ? (cfS.type === "token" ? "API-Token aktiv" : "Global API Key – besser einen eingeschränkten Token verwenden!") : cfS.error),
     stat("Ollama", ol.ok ? (ol.default_available ? "ok" : "warn") : "bad", ol.ok ? `${ol.models} Modelle` : "Nicht erreichbar",
       ol.ok ? (ol.default_available ? `Standard: ${ol.default_model}` : `Standardmodell ${ol.default_model} fehlt`) : `${ol.url} – ${ol.error}`),
-    stat("DDNS-Konfiguration", dd.exists && dd.writable ? "ok" : "bad", dd.exists ? (dd.writable ? "Beschreibbar" : "Nur lesbar") : "Datei fehlt", dd.file),
-    stat("Applier", !ap.enabled ? "warn" : ap.alive ? "ok" : "bad", !ap.enabled ? "Deaktiviert" : ap.alive ? "Bereit" : "Keine Rückmeldung",
-      ap.last_result ? `Letzter Lauf: ${ap.last_result.ok ? "erfolgreich" : "fehlgeschlagen"} (${fmtTime(ap.last_result.finished)})` : "Erstellt den DDNS-Container nach Änderungen neu"));
+    stat("DDNS-Updater", !dd.enabled ? "warn" : dd.error ? "bad" : "ok",
+      !dd.enabled ? "Pausiert" : dd.error ? "Fehler" : `${dd.hosts} Hosts aktuell`,
+      [dd.error, ipText || "Öffentliche IP noch nicht ermittelt", dd.last_run ? `Letzter Lauf ${fmtTime(dd.last_run)}` : null].filter(Boolean).join(" · ")));
 
   const zoneCard = h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Domains"), h("span", { class: "sub" }, "Zonen in deinem Cloudflare-Konto")));
   put(page, pageHead("Übersicht", "Status aller angebundenen Dienste und deine Cloudflare-Zonen.",
@@ -254,7 +266,12 @@ async function viewDns(page, force = false) {
       h("td", {}, h("span", { class: "badge type" }, r.type)),
       h("td", { class: "name" }, r.name, r.in_ddns ? [" ", h("span", { class: "badge ddns", title: "Wird von cloudflare-ddns aktualisiert" }, "DDNS")] : null),
       h("td", { class: "content", title: r.content }, r.content),
-      h("td", {}, r.proxiable ? cloud(r.proxied) : h("span", { class: "muted small" }, "–")),
+      h("td", {}, r.proxiable ? proxyButton(r.proxied, async (next) => {
+        await api(`/api/zones/${zone.id}/records/${r.id}`, { method: "PATCH", body: { proxied: next } });
+        r.proxied = next;
+        toast(`${r.name}: ${next ? "Proxy aktiviert" : "nur DNS"}`, "ok");
+        draw();
+      }) : h("span", { class: "muted small" }, "–")),
       h("td", { class: "nowrap" }, r.ttl === 1 ? "Auto" : r.ttl + " s"),
       h("td", { class: "actions" },
         ["A", "AAAA", "CNAME"].includes(r.type) ? h("button", { class: "btn sm link", onclick: () => { state.scanHosts.add(r.name); toast(`${r.name} zum Sicherheitscheck hinzugefügt`, "ok"); } }, "Prüfen") : null,
@@ -283,7 +300,7 @@ function confirmDeleteRecord(zone, r, after) {
     title: "DNS-Record löschen", danger: true, confirmText: "Endgültig löschen",
     body: [h("p", {}, "Der folgende Record wird bei Cloudflare gelöscht:"),
       h("p", {}, h("span", { class: "badge type" }, r.type), " ", h("b", {}, r.name), " → ", h("code", {}, r.content)),
-      r.in_ddns ? h("div", { class: "alert warn" }, "Dieser Name steht noch in der DDNS-Liste – cloudflare-ddns würde ihn wieder anlegen. Zuerst unter „DDNS-Domains“ entfernen.") : null,
+      r.in_ddns ? h("div", { class: "alert warn" }, "Dieser Host wird vom DDNS-Updater verwaltet und würde beim nächsten Lauf wieder angelegt. Zuerst unter „DDNS“ entfernen.") : null,
       h("label", { class: "field" }, h("span", {}, "Zur Bestätigung den Namen eintippen"), input)],
     onConfirm: async () => {
       await api(`/api/zones/${zone.id}/records/${r.id}`, { method: "DELETE", body: { confirm: input.value } });
@@ -294,133 +311,248 @@ function confirmDeleteRecord(zone, r, after) {
 }
 
 // ------------------------------------------------------------------ ddns
+const TTL_LABEL = (t) => (t === 1 ? "Auto" : t < 60 ? `${t} s` : t < 3600 ? `${t / 60} min` : `${t / 3600} h`);
+const fmtAgo = (ts) => {
+  if (!ts) return "–";
+  const d = Math.round(Date.now() / 1000 - ts);
+  return d < 60 ? `vor ${d} s` : d < 3600 ? `vor ${Math.round(d / 60)} min` : fmtTime(ts);
+};
+
+function toggle(checked, onChange, label) {
+  const input = h("input", { type: "checkbox", checked, role: "switch" });
+  input.addEventListener("change", () => onChange(input.checked, input));
+  return h("label", { class: "switch" }, input, h("span", { class: "slider" }), label ? h("span", {}, label) : null);
+}
+
 async function viewDdns(page) {
-  const data = await api("/api/ddns");
-  const pending = {};
-  for (const [k, list] of Object.entries(data.keys)) pending[k] = { orig: list, removed: new Set(), added: [] };
-  const saveBtn = h("button", { class: "btn primary", disabled: true }, "Änderungen speichern");
-  const applyBox = h("div");
+  const d = await api("/api/ddns");
+  const s = d.settings, st = d.state;
+  const reload = () => viewDdns(page).catch((e) => toast(e.message, "error"));
 
-  const dirty = () => Object.values(pending).some((p) => p.removed.size || p.added.length);
-  const refreshSave = () => { saveBtn.disabled = !dirty(); };
-
-  function keyCard(key) {
-    const p = pending[key];
-    const tbody = h("tbody");
-    const draw = () => {
-      const rows = [];
-      for (const d of p.orig) {
-        const rem = p.removed.has(d.name);
-        const recs = d.records;
-        rows.push(h("tr", { class: rem ? "muted" : "" },
-          h("td", { class: "name" }, rem ? h("s", {}, d.name) : d.name),
-          h("td", { class: "content" }, recs.length ? recs.map((r) => `${r.type} ${r.content}`).join(", ") : h("span", { class: "muted" }, "kein A/AAAA-Record")),
-          h("td", {}, recs.length ? cloud(recs.every((r) => r.proxied)) : "–"),
-          h("td", { class: "actions" }, rem
-            ? h("button", { class: "btn sm", onclick: () => { p.removed.delete(d.name); draw(); refreshSave(); } }, "Rückgängig")
-            : h("button", { class: "btn sm danger", onclick: () => { p.removed.add(d.name); draw(); refreshSave(); } }, icon("trash"), "Entfernen"))));
-      }
-      for (const name of p.added) {
-        rows.push(h("tr", {}, h("td", { class: "name" }, name, " ", h("span", { class: "badge sev-ok" }, "neu")), h("td", { class: "muted" }, "wird nach dem Anwenden angelegt"), h("td", {}, "–"),
-          h("td", { class: "actions" }, h("button", { class: "btn sm", onclick: () => { p.added = p.added.filter((x) => x !== name); draw(); refreshSave(); } }, "Verwerfen"))));
-      }
-      tbody.replaceChildren(...(rows.length ? rows : [h("tr", {}, h("td", { colspan: "4", class: "empty" }, `${key} ist leer.`))]));
-    };
-    draw();
-    const add = h("input", { type: "text", placeholder: "sub.beispiel.de", autocomplete: "off" });
-    const doAdd = () => {
-      const v = add.value.trim().toLowerCase().replace(/\.$/, "");
-      if (!/^(\*\.)?([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$/.test(v)) { toast("Ungültiger Hostname", "error"); return; }
-      if (p.orig.some((d) => d.name === v) || p.added.includes(v)) { toast("Bereits vorhanden", "error"); return; }
-      p.added.push(v); add.value = ""; draw(); refreshSave();
-    };
-    add.addEventListener("keydown", (e) => { if (e.key === "Enter") doAdd(); });
-    return h("div", { class: "card" },
-      h("div", { class: "card-head" }, h("h2", {}, h("code", {}, key)), h("span", { class: "sub" }, `${p.orig.length} Hosts`),
-        h("div", { class: "right" }, add, h("button", { class: "btn sm", onclick: doAdd }, icon("plus"), "Hinzufügen"))),
-      h("div", { class: "table-wrap" }, h("table", {},
-        h("thead", {}, h("tr", {}, h("th", {}, "Hostname"), h("th", {}, "Aktueller Record"), h("th", {}, "Proxy"), h("th", {}))), tbody)));
+  async function saveSettings(patch) {
+    try {
+      await api("/api/ddns/settings", { method: "PUT", body: { ...s, ...patch } });
+      Object.assign(s, patch);
+      toast("Einstellungen gespeichert", "ok");
+    } catch (e) { toast(e.message, "error"); }
+    reload();
+  }
+  async function saveHost(host, patch) {
+    const body = { name: host.name, ipv4: host.ipv4, ipv6: host.ipv6, proxied: host.proxied, ttl: host.ttl, enabled: host.enabled, ...patch };
+    await api("/api/ddns/hosts", { method: "PUT", body });
+    Object.assign(host, patch);
+    toast(`${host.name} gespeichert – wird beim nächsten Lauf übernommen`, "ok");
+    reload();
   }
 
-  saveBtn.addEventListener("click", () => {
-    const removed = Object.values(pending).flatMap((p) => [...p.removed]);
-    const added = Object.values(pending).flatMap((p) => p.added);
-    const removedWithRecords = Object.values(pending).flatMap((p) => p.orig.filter((d) => p.removed.has(d.name) && d.records.length));
-    const delBox = h("input", { type: "checkbox" });
-    modal({
-      title: "DDNS-Liste ändern", confirmText: "Speichern",
-      body: [
-        removed.length ? h("p", {}, h("b", {}, "Entfernen: "), removed.join(", ")) : null,
-        added.length ? h("p", {}, h("b", {}, "Hinzufügen: "), added.join(", ")) : null,
-        h("p", { class: "muted small" }, "Vorher wird automatisch ein Backup der Datei angelegt. Danach den DDNS-Container über „Jetzt anwenden“ neu erstellen lassen."),
-        removedWithRecords.length && state.session.allow_dns_delete
-          ? h("label", { class: "check" }, delBox, `Auch die ${removedWithRecords.length} zugehörigen DNS-Records bei Cloudflare löschen`)
-          : removedWithRecords.length ? h("div", { class: "alert info small" }, "Hinweis: cloudflare-ddns löscht die DNS-Records nicht. Sie bleiben bei Cloudflare bestehen (mit der zuletzt gesetzten IP).") : null,
-      ],
-      onConfirm: async () => {
-        const body = { domains: {} };
-        for (const [k, p] of Object.entries(pending))
-          body.domains[k] = p.orig.map((d) => d.name).filter((n) => !p.removed.has(n)).concat(p.added);
-        await api("/api/ddns", { method: "PUT", body });
-        toast("DDNS-Liste gespeichert", "ok");
-        if (delBox.checked) {
-          for (const d of removedWithRecords)
-            for (const r of d.records) {
-              try { await api(`/api/zones/${r.zone_id}/records/${r.id}`, { method: "DELETE", body: { confirm: d.name } }); toast(`${r.type} ${d.name} gelöscht`, "ok"); }
-              catch (e) { toast(`${d.name}: ${e.message}`, "error"); }
-            }
-        }
-        await viewDdns(page);
-        showApply(true);
-      },
-    });
+  // ---- status / settings
+  const runBtn = h("button", { class: "btn", disabled: st.running }, icon("refresh"), st.running ? "Läuft…" : "Jetzt aktualisieren");
+  runBtn.addEventListener("click", async () => {
+    runBtn.disabled = true;
+    try { await api("/api/ddns/run", { method: "POST" }); toast("Aktualisierung abgeschlossen", "ok"); } catch (e) { toast(e.message, "error"); }
+    reload();
+  });
+  const intervalSel = h("select", { onchange: (e) => saveSettings({ interval: Number(e.target.value) }) },
+    [60, 120, 300, 600, 900, 1800, 3600].map((v) => h("option", { value: v, selected: v === s.interval }, `alle ${v / 60} min`)));
+  const ipLine = (v) => {
+    const on = s[`ipv${v}`];
+    const ip = st.ip[v], err = st.ip_error[v];
+    return h("div", { class: "ip-line" },
+      toggle(on, (val) => saveSettings({ [`ipv${v}`]: val }), `IPv${v}`),
+      !on ? h("span", { class: "muted small" }, "deaktiviert")
+        : ip ? h("code", { class: "ip" }, ip)
+        : err ? h("span", { class: "badge sev-high", title: err }, "nicht ermittelbar")
+        : h("span", { class: "muted small" }, "noch nicht ermittelt"));
+  };
+  const statusCard = h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "DDNS-Updater"),
+      h("span", { class: "badge " + (!s.enabled ? "sev-medium" : st.error ? "sev-high" : "sev-ok") }, !s.enabled ? "Pausiert" : st.error ? st.error : "Aktiv"),
+      h("div", { class: "right" }, toggle(s.enabled, (val) => saveSettings({ enabled: val }), s.enabled ? "Ein" : "Aus"), intervalSel, runBtn)),
+    h("div", { class: "card-body ddns-status" },
+      h("div", {}, h("div", { class: "label" }, "Öffentliche IP"), ipLine(4), ipLine(6)),
+      h("div", {}, h("div", { class: "label" }, "Letzter Lauf"), h("div", {}, fmtAgo(st.last_run))),
+      h("div", {}, h("div", { class: "label" }, "Nächster Lauf"), h("div", {}, s.enabled && st.next_run ? fmtTime(st.next_run) : "–")),
+      h("div", {}, h("div", { class: "label" }, "Benachrichtigung"), h("div", {}, d.notify ? "aktiv (NOTIFY_URL)" : h("span", { class: "muted" }, "aus")))));
+
+  // ---- hosts table
+  const addName = h("input", { type: "text", placeholder: "sub.deinedomain.de", autocomplete: "off" });
+  const addV4 = h("input", { type: "checkbox", checked: true });
+  const addV6 = h("input", { type: "checkbox", checked: s.ipv6 });
+  const addProxy = h("input", { type: "checkbox", checked: true });
+  const doAdd = async () => {
+    const name = addName.value.trim().toLowerCase().replace(/\.$/, "");
+    if (!name) return;
+    try {
+      await api("/api/ddns/hosts", { method: "POST", body: { name, ipv4: addV4.checked, ipv6: addV6.checked, proxied: addProxy.checked, ttl: 1 } });
+      toast(`${name} hinzugefügt`, "ok");
+      reload();
+    } catch (e) { toast(e.message, "error"); }
+  };
+  addName.addEventListener("keydown", (e) => { if (e.key === "Enter") doAdd(); });
+
+  const rows = d.hosts.map((host) => {
+    const recs = host.records || [];
+    const status = host.status;
+    const ttlSel = h("select", { class: "sm", disabled: host.proxied, title: host.proxied ? "Bei Proxy setzt Cloudflare die TTL automatisch" : "" },
+      d.ttl_choices.map((t) => h("option", { value: t, selected: t === host.ttl }, TTL_LABEL(t))));
+    ttlSel.addEventListener("change", () => saveHost(host, { ttl: Number(ttlSel.value) }).catch((e) => toast(e.message, "error")));
+    const fam = (v) => {
+      const cb = h("input", { type: "checkbox", checked: host[`ipv${v}`], title: `IPv${v} (${v === 4 ? "A" : "AAAA"}-Record) pflegen` });
+      cb.addEventListener("change", () => saveHost(host, { [`ipv${v}`]: cb.checked }).catch((e) => { cb.checked = !cb.checked; toast(e.message, "error"); }));
+      return cb;
+    };
+    return h("tr", { class: host.enabled ? "" : "muted" },
+      h("td", { class: "name" }, host.name, !host.enabled ? [" ", h("span", { class: "badge sev-info" }, "pausiert")] : null),
+      h("td", { class: "center" }, fam(4)),
+      h("td", { class: "center" }, fam(6)),
+      h("td", {}, proxyButton(host.proxied, (next) => saveHost(host, { proxied: next }))),
+      h("td", {}, ttlSel),
+      h("td", { class: "content", title: recs.map((r) => `${r.type} ${r.content}`).join(", ") },
+        recs.length ? recs.map((r) => `${r.type} ${r.content}`).join(", ") : h("span", { class: "muted" }, "wird angelegt")),
+      h("td", { class: "small" }, !status ? h("span", { class: "muted" }, "noch nicht geprüft")
+        : h("span", { title: status.msgs.join("\n") }, h("span", { class: "dot " + (status.ok ? "ok" : "bad") }), " ", status.msgs.join(" · "),
+          h("div", { class: "muted" }, fmtAgo(status.ts)))),
+      h("td", { class: "actions" },
+        h("button", { class: "btn sm", onclick: () => saveHost(host, { enabled: !host.enabled }).catch((e) => toast(e.message, "error")) }, host.enabled ? "Pausieren" : "Fortsetzen"),
+        " ",
+        h("button", { class: "btn sm danger", title: "Aus DDNS entfernen", onclick: () => confirmRemoveHost(host, reload) }, icon("trash"))));
   });
 
-  function showApply(highlight) {
-    const ap = data.applier;
-    const st = h("div", { class: "small muted" });
-    const prog = h("div", { class: "progress indeterminate hidden" }, h("div"));
-    const btn = h("button", { class: "btn primary", disabled: !ap.enabled }, icon("ddns"), "Jetzt anwenden");
-    const lastRes = (r) => r ? h("span", {}, `Letzter Lauf ${fmtTime(r.finished)}: `, h("span", { class: "badge " + (r.ok ? "sev-ok" : "sev-high") }, r.ok ? "erfolgreich" : `Fehler (Exit ${r.exit_code})`)) : "Noch nicht ausgeführt.";
-    st.append(lastRes(ap.last_result));
-    const out = h("pre", { class: "small mono hidden" });
-    btn.addEventListener("click", async () => {
-      btn.disabled = true; prog.classList.remove("hidden");
-      try {
-        const { nonce } = await api("/api/ddns/apply", { method: "POST" });
-        const started = Date.now();
-        const poll = async () => {
-          const s = await api("/api/ddns/apply");
-          if (s.last_result && s.last_result.nonce === nonce) {
-            prog.classList.add("hidden"); btn.disabled = false;
-            st.replaceChildren(lastRes(s.last_result));
-            out.textContent = s.last_result.output || ""; out.classList.toggle("hidden", !out.textContent);
-            toast(s.last_result.ok ? "DDNS-Container neu erstellt" : "Anwenden fehlgeschlagen", s.last_result.ok ? "ok" : "error");
-          } else if (Date.now() - started > 120000) {
-            prog.classList.add("hidden"); btn.disabled = false;
-            toast("Applier antwortet nicht. Läuft der Container 'applier'?", "error");
-          } else state.pollTimer = setTimeout(() => poll().catch((e) => toast(e.message, "error")), 1500);
-        };
-        poll();
-      } catch (e) { toast(e.message, "error"); btn.disabled = false; prog.classList.add("hidden"); }
+  const hostCard = h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Hosts"), h("span", { class: "sub" }, `${d.hosts.length} verwaltet`),
+      h("div", { class: "right add-host" }, addName,
+        h("label", { class: "check small" }, addV4, "IPv4"), h("label", { class: "check small" }, addV6, "IPv6"),
+        h("label", { class: "check small" }, addProxy, "Proxy"),
+        h("button", { class: "btn sm", onclick: doAdd }, icon("plus"), "Hinzufügen"))),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Hostname"), h("th", { class: "center" }, "IPv4"), h("th", { class: "center" }, "IPv6"),
+        h("th", {}, "Proxy"), h("th", {}, "TTL"), h("th", {}, "Record bei Cloudflare"), h("th", {}, "Status"), h("th", {}))),
+      h("tbody", {}, rows.length ? rows : h("tr", {}, h("td", { colspan: "8", class: "empty" },
+        "Noch keine Hosts. Über „Importieren“ deine Subdomains aus favonia übernehmen oder oben einzeln hinzufügen."))))));
+
+  const historyCard = h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "IP-Verlauf"), h("span", { class: "sub" }, "Wechsel deiner öffentlichen IP")),
+    d.history.length ? h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Zeit"), h("th", {}, "Typ"), h("th", {}, "Alt"), h("th", {}, "Neu"))),
+      h("tbody", {}, d.history.map((x) => h("tr", {}, h("td", { class: "nowrap small" }, fmtTime(x.ts)), h("td", {}, `IPv${x.version}`),
+        h("td", { class: "content" }, x.old || "–"), h("td", { class: "content" }, x.new))))))
+      : h("div", { class: "empty" }, "Noch keine Einträge."));
+
+  put(page,
+    pageHead("DDNS", "Der eingebaute Updater hält die A/AAAA-Records deiner Hosts auf deiner aktuellen öffentlichen IP – inkl. Proxy-Status und TTL. favonia/cloudflare-ddns wird damit nicht mehr gebraucht.",
+      h("button", { class: "btn primary", onclick: () => importDialog(reload) }, icon("plus"), "Importieren")),
+    d.cf_error ? h("div", { class: "alert error" }, d.cf_error) : null,
+    !s.enabled ? h("div", { class: "alert warn" }, h("div", {}, h("b", {}, "Updater ist pausiert"),
+      "Ablauf beim Umstieg: 1. Hosts importieren und Proxy-Einstellungen prüfen · 2. favonia-Container stoppen (",
+      h("code", {}, "docker compose down"), " im CloudflareDNS-Ordner) · 3. hier einschalten. Laufen beide gleichzeitig, setzt favonia seine Proxy-Einstellungen zurück.")) : null,
+    s.enabled && st.ip_error && st.ip_error["6"] && s.ipv6 ? h("div", { class: "alert warn" }, h("div", {}, h("b", {}, "IPv6 nicht ermittelbar"),
+      "Der Container hat kein IPv6. Entweder IPv6 hier ausschalten oder im Docker-Netz aktivieren (siehe README).")) : null,
+    statusCard, hostCard, historyCard);
+}
+
+function confirmRemoveHost(host, after) {
+  const del = h("input", { type: "checkbox" });
+  const hasRecs = (host.records || []).length > 0;
+  modal({
+    title: "Host aus DDNS entfernen", danger: true, confirmText: "Entfernen",
+    body: [h("p", {}, h("b", {}, host.name), " wird nicht mehr automatisch aktualisiert."),
+      hasRecs && state.session.allow_dns_delete ? h("label", { class: "check" }, del, `Auch die ${host.records.length} A/AAAA-Record(s) bei Cloudflare löschen`)
+        : hasRecs ? h("div", { class: "alert info small" }, "Der DNS-Record bleibt bei Cloudflare mit der letzten IP bestehen. (Löschen erfordert ALLOW_DNS_DELETE=true.)") : null],
+    onConfirm: async () => {
+      const res = await api("/api/ddns/hosts", { method: "DELETE", body: { name: host.name, delete_records: del.checked } });
+      toast(`${host.name} entfernt${res.deleted.length ? ` (${res.deleted.length} Record(s) gelöscht)` : ""}`, "ok");
+      after();
+    },
+  });
+}
+
+function importDialog(after) {
+  const tabs = h("div", { class: "tabs" });
+  const pane = h("div");
+  let candidates = [];
+  const m = modal({ title: "Hosts importieren", wide: true, confirmText: "Importieren", body: [tabs, pane],
+    onConfirm: async () => {
+      const chosen = candidates.filter((c) => c.selected);
+      if (!chosen.length) { toast("Nichts ausgewählt", "error"); return false; }
+      const res = await api("/api/ddns/import", { method: "POST", body: { hosts: chosen.map((c) => ({ name: c.name, ipv4: c.ipv4, ipv6: c.ipv6, proxied: c.proxied, ttl: 1 })) } });
+      toast(`${res.added.length} importiert${res.skipped.length ? `, ${res.skipped.length} übersprungen` : ""}`, "ok");
+      after();
+    } });
+  m.button.disabled = true;
+
+  function showCandidates(list, note) {
+    candidates = list.map((c) => ({ ...c, selected: !c.managed && !!c.zone && (c.ipv4 || c.ipv6) }));
+    const count = h("span", { class: "small muted" });
+    const update = () => {
+      const n = candidates.filter((c) => c.selected).length;
+      count.textContent = `${n} ausgewählt`;
+      m.button.disabled = !n;
+      m.button.textContent = n ? `${n} importieren` : "Importieren";
+    };
+    const rows = candidates.map((c) => {
+      const usable = !c.managed && !!c.zone;
+      const sel = h("input", { type: "checkbox", checked: c.selected, disabled: !usable });
+      sel.addEventListener("change", () => { c.selected = sel.checked; update(); });
+      const fam = (k) => { const cb = h("input", { type: "checkbox", checked: c[k], disabled: !usable }); cb.addEventListener("change", () => { c[k] = cb.checked; }); return cb; };
+      const proxyCell = h("td");
+      const drawProxy = () => proxyCell.replaceChildren(proxyButton(c.proxied, async (next) => { c.proxied = next; drawProxy(); }, !usable));
+      drawProxy();
+      return h("tr", { class: usable ? "" : "muted" },
+        h("td", {}, sel), h("td", { class: "name" }, c.name),
+        h("td", { class: "center" }, fam("ipv4")), h("td", { class: "center" }, fam("ipv6")), proxyCell,
+        h("td", { class: "content small" }, c.records.length ? c.records.map((r) => `${r.type} ${r.content}`).join(", ") : "neu"),
+        h("td", { class: "small" }, c.managed ? "bereits verwaltet" : !c.zone ? h("span", { class: "badge sev-high" }, "keine Zone") : c.zone));
     });
-    applyBox.replaceChildren(h("div", { class: "card" + (highlight ? " highlight" : "") },
-      h("div", { class: "card-head" }, h("h2", {}, "Änderungen anwenden"),
-        h("span", { class: "sub" }, "cloudflare-ddns liest die Domains nur beim Start – der Container wird dafür neu erstellt."),
-        h("div", { class: "right" }, h("span", { class: "dot " + (!ap.enabled ? "warn" : ap.alive ? "ok" : "bad") }), h("span", { class: "small" }, !ap.enabled ? "Applier deaktiviert" : ap.alive ? "Applier bereit" : "Applier offline"), btn)),
-      h("div", { class: "card-body" }, prog, st, out,
-        !ap.enabled ? h("p", { class: "small" }, "Manuell im CloudflareDNS-Verzeichnis: ", h("code", {}, "docker compose up -d cloudflare-ddns")) : null)));
+    put(pane, note,
+      rows.length ? [h("div", { class: "toolbar" }, count), h("div", { class: "table-wrap import-table" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}), h("th", {}, "Hostname"), h("th", { class: "center" }, "IPv4"), h("th", { class: "center" }, "IPv6"),
+          h("th", {}, "Proxy"), h("th", {}, "Aktuell"), h("th", {}, "Zone"))), h("tbody", {}, rows)))]
+        : h("div", { class: "empty" }, "Keine Hosts gefunden."));
+    update();
   }
 
-  const st = data.status;
-  put(page, 
-    pageHead("DDNS-Domains", "Hosts, deren IP der Container favonia/cloudflare-ddns automatisch aktualisiert. Entfernte Hosts werden danach nicht mehr aktualisiert.", saveBtn),
-    !st.exists ? h("div", { class: "alert warn" }, h("div", {}, h("b", {}, "DDNS-Datei nicht gefunden"), `${st.file} existiert nicht. Siehe README → „DDNS-Container umstellen“.`)) : null,
-    st.exists && !st.writable ? h("div", { class: "alert error" }, `${st.file} ist nicht beschreibbar.`) : null,
-    data.cf_error ? h("div", { class: "alert warn" }, data.cf_error) : null,
-    Object.keys(pending).map(keyCard),
-    applyBox);
-  showApply(false);
+  function select(tab) {
+    tabs.querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
+    candidates = []; m.button.disabled = true;
+    if (tab === "paste") {
+      const ta = h("textarea", { rows: "7", placeholder: "Inhalt deiner favonia docker-compose.yml / .env einfügen, z.B.\nDOMAINS=example.org,www.example.org\nPROXIED=true\n\n…oder einfach eine Liste von Hostnamen." });
+      const go = h("button", { class: "btn" }, "Auslesen");
+      go.addEventListener("click", async () => {
+        go.disabled = true;
+        try {
+          const res = await api("/api/ddns/import/parse", { method: "POST", body: { text: ta.value } });
+          showCandidates(res.candidates, [ta, h("div", { class: "toolbar" }, go), parseNote(res)]);
+        } catch (e) { toast(e.message, "error"); } finally { go.disabled = false; }
+      });
+      put(pane, h("p", { class: "small muted" }, "Tokens o.Ä. werden ignoriert – ausgelesen werden nur DOMAINS, IP4_DOMAINS, IP6_DOMAINS und PROXIED. Der Text wird nicht gespeichert."), ta, h("div", { class: "toolbar" }, go));
+      return;
+    }
+    put(pane, h("div", { class: "progress indeterminate" }, h("div")));
+    sources.then((src) => {
+      if (tab === "folder") {
+        const f = src.folder;
+        if (!f.available) {
+          put(pane, h("div", { class: "alert info" }, h("div", {}, h("b", {}, "Kein favonia-Ordner eingebunden"),
+            "In .env ", h("code", {}, "DDNS_IMPORT_DIR"), " auf deinen CloudflareDNS-Ordner setzen und neu starten – oder den Tab „Einfügen“ nutzen.")));
+          return;
+        }
+        showCandidates(f.candidates, h("p", { class: "small muted" }, `Gelesen: ${f.files.join(", ") || "keine passenden Dateien"}. `, parseNote(f)));
+      } else {
+        const ipTxt = Object.entries(src.ip).map(([v, ip]) => `IPv${v} ${ip}`).join(", ");
+        showCandidates(src.suggestions, h("p", { class: "small muted" }, ipTxt
+          ? `Alle A/AAAA-Records, die gerade auf deine öffentliche IP zeigen (${ipTxt}) – vermutlich deine bisherigen DDNS-Hosts.`
+          : "Öffentliche IP konnte nicht ermittelt werden."));
+      }
+    }).catch((e) => put(pane, errorBox(e)));
+  }
+  const parseNote = (res) => [
+    res.proxied_expr ? h("div", { class: "alert info small" }, "favonia nutzt einen PROXIED-Ausdruck. Der Proxy-Status wurde daher vom aktuellen Record übernommen – bitte prüfen.") : null,
+    res.invalid ? h("div", { class: "alert warn small" }, `${res.invalid} Eintrag/Einträge waren kein gültiger Hostname und wurden ignoriert.`) : null,
+  ];
+  const sources = api("/api/ddns/import");
+  for (const [id, label] of [["folder", "Aus favonia-Ordner"], ["suggest", "Vorschläge aus Cloudflare"], ["paste", "Einfügen"]])
+    tabs.append(h("button", { class: "tab", type: "button", "data-tab": id, onclick: () => select(id) }, label));
+  select("folder");
 }
 
 // ------------------------------------------------------------------ scan

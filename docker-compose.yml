@@ -1,20 +1,14 @@
-# DomainManager – Cloudflare DNS / DDNS dashboard with local AI security check.
+# DomainManager – Cloudflare DNS dashboard with built-in DDNS updater and local AI security check.
 # Setup: see README.md. All values come from .env and ./secrets/.
-
-x-hardening: &hardening
-  read_only: true
-  cap_drop: [ALL]
-  security_opt: ["no-new-privileges:true"]
-  restart: unless-stopped
-  logging:
-    driver: json-file
-    options: { max-size: "5m", max-file: "3" }
 
 services:
   dashboard:
-    <<: *hardening
     build: ./dashboard
     image: domainmanager-dashboard:local
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
     ports:
       # Default only on localhost. For LAN access set BIND_ADDR to the server's LAN IP.
       - "${BIND_ADDR:-127.0.0.1}:${PORT:-8443}:8443"
@@ -23,14 +17,14 @@ services:
       ADMIN_PASSWORD_HASH_FILE: /run/secrets/admin_password_hash
       TOTP_SECRET_FILE: /run/secrets/totp_secret
       CF_API_TOKEN_FILE: /run/secrets/cf_api_token
+      NOTIFY_URL: ${NOTIFY_URL:-}
       OLLAMA_URL: ${OLLAMA_URL:?OLLAMA_URL in .env setzen}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
       OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-8192}
       OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-2m}
       OLLAMA_MAX_MODEL_GB: ${OLLAMA_MAX_MODEL_GB:-10}
-      DDNS_ENV_FILE: /ddns/ddns.env
-      DDNS_DOMAIN_KEYS: ${DDNS_DOMAIN_KEYS:-DOMAINS,IP4_DOMAINS,IP6_DOMAINS}
-      APPLIER_ENABLED: ${APPLIER_ENABLED:-true}
+      DDNS_INTERVAL: ${DDNS_INTERVAL:-300}
+      DDNS_IPV6: ${DDNS_IPV6:-false}
       ALLOW_DNS_DELETE: ${ALLOW_DNS_DELETE:-false}
       ALLOWED_NETWORKS: ${ALLOWED_NETWORKS:-127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7}
       TLS_MODE: ${TLS_MODE:-selfsigned}
@@ -42,37 +36,25 @@ services:
     secrets: [admin_password_hash, totp_secret, cf_api_token]
     volumes:
       - dm-data:/data
-      - applier:/applier
-      # Only the "managed" sub-folder of the DDNS project – never its docker-compose.yml.
-      - ${DDNS_PROJECT_DIR:?DDNS_PROJECT_DIR in .env setzen}/managed:/ddns
+      # Optional, read-only: your old favonia/CloudflareDNS folder for the one-time import.
+      # Only DOMAINS/IP4_DOMAINS/IP6_DOMAINS/PROXIED are read. Remove after importing.
+      - ${DDNS_IMPORT_DIR:-./import}:/import:ro
     tmpfs:
       - /tmp:size=16m,mode=1777,noexec,nosuid
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks: [dm]
     mem_limit: 256m
     cpus: 1.0
     pids_limit: 128
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "3" }
 
-  applier:
-    <<: *hardening
-    build: ./applier
-    image: domainmanager-applier:local
-    # No network at all: it only talks to the local Docker socket.
-    network_mode: none
-    environment:
-      DDNS_PROJECT_DIR: ${DDNS_PROJECT_DIR}
-      DDNS_SERVICE: ${DDNS_SERVICE:-cloudflare-ddns}
-      DDNS_PROJECT_NAME: ${DDNS_PROJECT_NAME:-}
-      DOCKER_CONFIG: /tmp/docker
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - applier:/applier
-      # Same absolute path as on the host, so compose resolves relative paths correctly.
-      - ${DDNS_PROJECT_DIR}:${DDNS_PROJECT_DIR}:ro
-    tmpfs:
-      - /tmp:size=8m,mode=1777,noexec,nosuid
-    mem_limit: 128m
-    pids_limit: 64
+networks:
+  dm:
+    # Needed only for AAAA records (DDNS_IPV6=true). Requires Docker >= 27 (ip6tables on by default).
+    enable_ipv6: ${DDNS_IPV6:-false}
 
 secrets:
   admin_password_hash:
@@ -84,4 +66,3 @@ secrets:
 
 volumes:
   dm-data:
-  applier:

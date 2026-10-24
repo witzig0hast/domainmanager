@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 import httpx
 
-from . import ddns
+from .updater import managed_names
 from .cloudflare import cf
 
 SEVERITY_ORDER = ["critical", "high", "medium", "low", "info", "ok"]
@@ -233,7 +233,7 @@ async def run_scan(hosts: list[str], progress) -> dict:
     started = time.time()
     all_records = await cf.all_records()
     zones = {z["id"]: z for z in await cf.zones()}
-    ddns_hosts = {d.lstrip("*.") for v in ddns.read().values() for d in v}
+    ddns_hosts = managed_names()
     by_host: dict[str, list[dict]] = {}
     for r in all_records:
         by_host.setdefault(r["name"], []).append(r)

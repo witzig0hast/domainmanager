@@ -15,11 +15,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import audit, ddns, ollama
+from . import audit, importer, ollama
 from .auth import SESSION_COOKIE, Session, limiter, sessions, verify_credentials
 from .cloudflare import CloudflareError, cf, valid_id
 from .config import settings
 from .scanner import run_scan
+from .updater import TTL_CHOICES, UpdaterError, host_entry, normalize, store, updater
 
 STATIC = Path(__file__).parent / "static"
 MAX_BODY = 64 * 1024
@@ -44,7 +45,9 @@ SEC_HEADERS = {
 async def lifespan(_app: FastAPI):
     if not settings.admin_password_hash:
         print("WARNUNG: Kein ADMIN_PASSWORD_HASH gesetzt – Login ist deaktiviert.", flush=True)
+    updater.start()
     yield
+    await updater.stop()
     await cf.close()
 
 
@@ -107,8 +110,8 @@ async def _cf_error(_req: Request, exc: CloudflareError):
     return JSONResponse({"detail": str(exc)}, status_code=exc.status)
 
 
-@app.exception_handler(ddns.DdnsError)
-async def _ddns_error(_req: Request, exc: ddns.DdnsError):
+@app.exception_handler(UpdaterError)
+async def _updater_error(_req: Request, exc: UpdaterError):
     return JSONResponse({"detail": str(exc)}, status_code=400)
 
 
@@ -134,7 +137,6 @@ async def session_info(request: Request):
     return {
         "authenticated": True, "user": s.user, "csrf": s.csrf, **base,
         "allow_dns_delete": settings.allow_dns_delete,
-        "applier_enabled": settings.applier_enabled,
         "default_model": settings.ollama_model,
         "max_scan_hosts": settings.max_scan_hosts,
     }
@@ -174,7 +176,9 @@ async def logout(request: Request, s: Session = Depends(require_session)):
 
 @app.get("/api/status")
 async def status(_s: Session = Depends(require_session)):
-    out: dict = {"ddns": ddns.status(), "applier": ddns.applier_status()}
+    st = updater.state
+    out: dict = {"ddns": {"enabled": store.data["enabled"], "hosts": len(store.hosts), "ip": st["ip"],
+                          "ip_error": st["ip_error"], "last_run": st["last_run"], "error": st["error"]}}
     try:
         out["cloudflare"] = {"ok": True, **await cf.verify()}
     except CloudflareError as exc:
@@ -208,8 +212,31 @@ async def records(zone_id: str, refresh: bool = False, _s: Session = Depends(req
     if refresh:
         cf.invalidate()
     await cf.zone(zone_id)
-    ddns_hosts = {d for v in ddns.read().values() for d in v}
-    return [{**r, "in_ddns": r["type"] in ("A", "AAAA") and r["name"] in ddns_hosts} for r in await cf.records(zone_id)]
+    managed = store.hosts
+    return [{**r, "in_ddns": r["type"] in ("A", "AAAA") and r["name"] in managed} for r in await cf.records(zone_id)]
+
+
+class ProxyIn(BaseModel):
+    proxied: bool
+
+
+@app.patch("/api/zones/{zone_id}/records/{record_id}")
+async def set_proxy(zone_id: str, record_id: str, body: ProxyIn, request: Request,
+                    s: Session = Depends(require_session)):
+    _check_id(zone_id), _check_id(record_id)
+    rec = next((r for r in await cf.records(zone_id) if r["id"] == record_id), None)
+    if rec is None:
+        raise HTTPException(404, "Record nicht gefunden")
+    if not rec["proxiable"]:
+        raise HTTPException(400, "Dieser Record kann nicht über Cloudflare geproxied werden")
+    await cf.update_record(zone_id, record_id, proxied=body.proxied)
+    # Keep the DDNS setting in sync, otherwise the next run would revert the change.
+    if rec["type"] in ("A", "AAAA") and rec["name"] in store.hosts:
+        store.hosts[rec["name"]]["proxied"] = body.proxied
+        await asyncio.to_thread(store.save)
+    audit.log("dns_proxy_changed", client_ip(request), user=s.user, name=rec["name"], type=rec["type"],
+              proxied=body.proxied)
+    return {"ok": True}
 
 
 class DeleteIn(BaseModel):
@@ -233,59 +260,211 @@ async def delete_record(zone_id: str, record_id: str, body: DeleteIn, request: R
     return {"ok": True}
 
 
-# ---------------------------------------------------------------- ddns
+# ---------------------------------------------------------------- ddns (built-in updater)
 
-@app.get("/api/ddns")
-async def ddns_get(_s: Session = Depends(require_session)):
-    domains = ddns.read()
-    cf_error = None
-    by_name: dict[str, list[dict]] = {}
-    try:
-        for r in await cf.all_records():
-            if r["type"] in ("A", "AAAA"):
-                by_name.setdefault(r["name"], []).append(
-                    {"type": r["type"], "content": r["content"], "proxied": r["proxied"],
-                     "zone_id": r["zone_id"], "id": r["id"]})
-    except CloudflareError as exc:
-        cf_error = str(exc)
+def _ddns_view() -> dict:
+    snap = store.snapshot()
+    st = updater.state
     return {
-        "status": ddns.status(),
-        "applier": ddns.applier_status(),
-        "cf_error": cf_error,
-        "keys": {k: [{"name": d, "records": by_name.get(d, [])} for d in v] for k, v in domains.items()},
+        "settings": {k: snap[k] for k in ("enabled", "interval", "ipv4", "ipv6")},
+        "state": {"ip": st["ip"], "ip_error": st["ip_error"], "ip_source": st["ip_source"],
+                  "last_run": st["last_run"], "next_run": st["next_run"], "running": st["running"],
+                  "error": st["error"]},
+        "hosts": [{"name": n, **h, "status": st["hosts"].get(n)} for n, h in sorted(snap["hosts"].items())],
+        "history": snap["history"][:30],
+        "notify": bool(settings.notify_url),
+        "ttl_choices": TTL_CHOICES,
     }
 
 
-class DdnsIn(BaseModel):
-    domains: dict[str, list[str]]
+@app.get("/api/ddns")
+async def ddns_get(_s: Session = Depends(require_session)):
+    view = _ddns_view()
+    try:
+        by_name: dict[str, list[dict]] = {}
+        for r in await cf.all_records():
+            if r["type"] in ("A", "AAAA") and r["name"] in store.hosts:
+                by_name.setdefault(r["name"], []).append(
+                    {"type": r["type"], "content": r["content"], "proxied": r["proxied"],
+                     "zone_id": r["zone_id"], "id": r["id"]})
+        for h in view["hosts"]:
+            h["records"] = by_name.get(h["name"], [])
+        view["cf_error"] = None
+    except CloudflareError as exc:
+        view["cf_error"] = str(exc)
+    return view
 
 
-@app.put("/api/ddns")
-async def ddns_put(body: DdnsIn, request: Request, s: Session = Depends(require_session)):
-    if sum(len(v) for v in body.domains.values()) > 500:
-        raise HTTPException(400, "Zu viele Einträge")
-    before = ddns.read()
-    after = await asyncio.to_thread(ddns.write, body.domains)
-    changes = {}
-    for k in after:
-        removed = sorted(set(before.get(k, [])) - set(after[k]))
-        added = sorted(set(after[k]) - set(before.get(k, [])))
-        if removed or added:
-            changes[k] = {"removed": removed, "added": added}
-    audit.log("ddns_updated", client_ip(request), user=s.user, changes=changes)
-    return {"domains": after, "changes": changes}
+class DdnsSettingsIn(BaseModel):
+    enabled: bool
+    interval: int = Field(ge=60, le=86400)
+    ipv4: bool
+    ipv6: bool
 
 
-@app.post("/api/ddns/apply")
-async def ddns_apply(request: Request, s: Session = Depends(require_session)):
-    nonce = await asyncio.to_thread(ddns.request_apply)
-    audit.log("ddns_apply_requested", client_ip(request), user=s.user, nonce=nonce)
-    return {"nonce": nonce}
+@app.put("/api/ddns/settings")
+async def ddns_settings(body: DdnsSettingsIn, request: Request, s: Session = Depends(require_session)):
+    before = {k: store.data[k] for k in ("enabled", "interval", "ipv4", "ipv6")}
+    store.data.update(body.model_dump())
+    await asyncio.to_thread(store.save)
+    audit.log("ddns_settings", client_ip(request), user=s.user, before=before, after=body.model_dump())
+    updater.trigger()
+    return _ddns_view()["settings"]
 
 
-@app.get("/api/ddns/apply")
-async def ddns_apply_status(_s: Session = Depends(require_session)):
-    return ddns.applier_status()
+class HostIn(BaseModel):
+    name: str = Field(max_length=253)
+    ipv4: bool = True
+    ipv6: bool = False
+    proxied: bool = False
+    ttl: int = 1
+    enabled: bool = True
+
+
+async def _require_zone(name: str) -> None:
+    if await cf.zone_for(name) is None:
+        raise HTTPException(400, f"{name} gehört zu keiner Zone in deinem Cloudflare-Konto")
+
+
+@app.post("/api/ddns/hosts")
+async def ddns_add(body: HostIn, request: Request, s: Session = Depends(require_session)):
+    name = normalize(body.name)
+    if name in store.hosts:
+        raise HTTPException(409, "Host wird bereits verwaltet")
+    await _require_zone(name)
+    store.hosts[name] = host_entry(body.ipv4, body.ipv6, body.proxied, body.ttl)
+    await asyncio.to_thread(store.save)
+    audit.log("ddns_host_added", client_ip(request), user=s.user, name=name, **store.hosts[name])
+    updater.trigger()
+    return {"ok": True}
+
+
+@app.put("/api/ddns/hosts")
+async def ddns_update(body: HostIn, request: Request, s: Session = Depends(require_session)):
+    name = normalize(body.name)
+    if name not in store.hosts:
+        raise HTTPException(404, "Host nicht gefunden")
+    entry = host_entry(body.ipv4, body.ipv6, body.proxied, body.ttl)
+    entry["enabled"] = body.enabled
+    entry["added"] = store.hosts[name].get("added", entry["added"])
+    store.hosts[name] = entry
+    await asyncio.to_thread(store.save)
+    audit.log("ddns_host_changed", client_ip(request), user=s.user, name=name, **entry)
+    updater.trigger()
+    return {"ok": True}
+
+
+class HostDeleteIn(BaseModel):
+    name: str = Field(max_length=253)
+    delete_records: bool = False
+
+
+@app.delete("/api/ddns/hosts")
+async def ddns_remove(body: HostDeleteIn, request: Request, s: Session = Depends(require_session)):
+    name = normalize(body.name)
+    if store.hosts.pop(name, None) is None:
+        raise HTTPException(404, "Host nicht gefunden")
+    await asyncio.to_thread(store.save)
+    updater.state["hosts"].pop(name, None)
+    deleted = []
+    if body.delete_records:
+        if not settings.allow_dns_delete:
+            raise HTTPException(403, "Host entfernt, Records aber NICHT gelöscht (ALLOW_DNS_DELETE=false).")
+        zone = await cf.zone_for(name)
+        if zone:
+            for r in await cf.records(zone["id"]):
+                if r["name"] == name and r["type"] in ("A", "AAAA"):
+                    await cf.delete_record(zone["id"], r["id"])
+                    deleted.append(f"{r['type']} {r['content']}")
+    audit.log("ddns_host_removed", client_ip(request), user=s.user, name=name, deleted_records=deleted)
+    return {"ok": True, "deleted": deleted}
+
+
+@app.post("/api/ddns/run")
+async def ddns_run(request: Request, s: Session = Depends(require_session)):
+    if updater.state["running"]:
+        raise HTTPException(409, "Läuft bereits")
+    audit.log("ddns_run_manual", client_ip(request), user=s.user)
+    await updater.run_once("manual")
+    return _ddns_view()
+
+
+# ----- import from favonia / text / Cloudflare suggestions
+
+async def _enrich(parsed: dict) -> list[dict]:
+    """Attach zone, existing records and a proxy suggestion to every parsed domain."""
+    records = await cf.all_records()
+    out = []
+    for name, fam in sorted(parsed["domains"].items()):
+        zone = await cf.zone_for(name)
+        recs = [r for r in records if r["name"] == name and r["type"] in ("A", "AAAA")]
+        if recs:
+            proxied = all(r["proxied"] for r in recs)
+        elif parsed.get("proxied_default") is not None:
+            proxied = parsed["proxied_default"]
+        else:
+            proxied = False
+        out.append({
+            "name": name, "ipv4": fam["ipv4"], "ipv6": fam["ipv6"], "proxied": proxied,
+            "zone": zone["name"] if zone else None, "managed": name in store.hosts,
+            "records": [{"type": r["type"], "content": r["content"], "proxied": r["proxied"]} for r in recs],
+        })
+    return out
+
+
+@app.get("/api/ddns/import")
+async def import_sources(_s: Session = Depends(require_session)):
+    found = await asyncio.to_thread(importer.scan_import_dir)
+    result: dict = {"folder": {"available": found["available"], "files": found.get("files", [])}}
+    if found["available"]:
+        result["folder"].update(candidates=await _enrich(found), proxied_expr=found.get("proxied_expr"),
+                                invalid=found.get("invalid", 0))
+    # Suggestions: records that already point at the current public IP are most likely DDNS hosts.
+    if not updater.state["ip"]:
+        await updater.refresh_ips()
+    ips = set(updater.state["ip"].values())
+    sugg: dict[str, dict] = {}
+    for r in await cf.all_records():
+        if r["type"] in ("A", "AAAA") and r["content"] in ips:
+            e = sugg.setdefault(r["name"], {"ipv4": False, "ipv6": False})
+            e["ipv4" if r["type"] == "A" else "ipv6"] = True
+    result["suggestions"] = await _enrich({"domains": sugg})
+    result["ip"] = updater.state["ip"]
+    return result
+
+
+class ParseIn(BaseModel):
+    text: str = Field(max_length=64 * 1024)
+
+
+@app.post("/api/ddns/import/parse")
+async def import_parse(body: ParseIn, _s: Session = Depends(require_session)):
+    parsed = importer.parse_texts([body.text])
+    if not parsed["domains"]:
+        # Plain list of hostnames (one per line or comma separated) is fine too.
+        parsed = importer.parse_texts(["DOMAINS=" + ",".join(re.split(r"[\s,;]+", body.text))])
+    return {"candidates": await _enrich(parsed), "proxied_expr": parsed["proxied_expr"],
+            "invalid": parsed["invalid"]}
+
+
+class ImportIn(BaseModel):
+    hosts: list[HostIn] = Field(max_length=500)
+
+
+@app.post("/api/ddns/import")
+async def import_apply(body: ImportIn, request: Request, s: Session = Depends(require_session)):
+    added, skipped = [], []
+    for h in body.hosts:
+        name = normalize(h.name)
+        if name in store.hosts or await cf.zone_for(name) is None:
+            skipped.append(name)
+            continue
+        store.hosts[name] = host_entry(h.ipv4, h.ipv6, h.proxied, h.ttl)
+        added.append(name)
+    await asyncio.to_thread(store.save)
+    audit.log("ddns_import", client_ip(request), user=s.user, added=added, skipped=skipped)
+    updater.trigger()
+    return {"added": added, "skipped": skipped}
 
 
 # ---------------------------------------------------------------- scans

@@ -139,6 +139,32 @@ class Cloudflare:
                 out.append({**r, "zone_id": z["id"], "zone_name": z["name"]})
         return out
 
+    def forget_records(self, zone_id: str) -> None:
+        self._cache.pop(f"records:{zone_id}", None)
+
+    async def create_record(self, zone_id: str, rtype: str, name: str, content: str,
+                            proxied: bool, ttl: int, comment: str = "") -> dict:
+        body = {"type": rtype, "name": name, "content": content, "proxied": proxied,
+                "ttl": 1 if proxied else ttl, "comment": comment}
+        res = await self._request("POST", f"/zones/{zone_id}/dns_records", json=body)
+        self.forget_records(zone_id)
+        return res["result"]
+
+    async def update_record(self, zone_id: str, record_id: str, **fields) -> dict:
+        res = await self._request("PATCH", f"/zones/{zone_id}/dns_records/{record_id}", json=fields)
+        self.forget_records(zone_id)
+        return res["result"]
+
+    async def zone_for(self, name: str) -> dict | None:
+        """The zone a hostname belongs to (longest matching suffix)."""
+        bare = name[2:] if name.startswith("*.") else name
+        best = None
+        for z in await self.zones():
+            if bare == z["name"] or bare.endswith("." + z["name"]):
+                if best is None or len(z["name"]) > len(best["name"]):
+                    best = z
+        return best
+
     async def delete_record(self, zone_id: str, record_id: str) -> None:
         await self._request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
         self._cache.pop(f"records:{zone_id}", None)

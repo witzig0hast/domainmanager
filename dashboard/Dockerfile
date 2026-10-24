@@ -9,8 +9,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 RUN groupadd --gid 10001 app \
  && useradd --uid 10001 --gid app --no-create-home --shell /usr/sbin/nologin app \
- && mkdir -p /data /ddns /applier \
- && chown app:app /data /applier && chmod 0777 /applier \
+ && mkdir -p /data /import \
+ && chown app:app /data \
  && rm -rf /var/lib/apt/lists/* \
  && pip uninstall -y pip setuptools wheel 2>/dev/null || true
 COPY --from=build /install /usr/local
