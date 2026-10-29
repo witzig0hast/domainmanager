@@ -27,9 +27,10 @@ MAX_HISTORY = 100
 
 # Same approach as favonia's default: Cloudflare's trace endpoint, with a fallback provider.
 PROVIDERS = {
-    4: ("https://1.1.1.1/cdn-cgi/trace", "https://1.0.0.1/cdn-cgi/trace", "https://api4.ipify.org"),
+    4: ("https://1.1.1.1/cdn-cgi/trace", "https://1.0.0.1/cdn-cgi/trace", "https://api4.ipify.org",
+        "https://ipv4.icanhazip.com"),
     6: ("https://[2606:4700:4700::1111]/cdn-cgi/trace", "https://[2606:4700:4700::1001]/cdn-cgi/trace",
-        "https://api6.ipify.org"),
+        "https://api6.ipify.org", "https://ipv6.icanhazip.com"),
 }
 
 
@@ -114,24 +115,33 @@ def _valid(raw: str, version: int) -> str | None:
     return str(ip) if ip.version == version and ip.is_global else None
 
 
+async def probe_provider(client: httpx.AsyncClient, url: str, version: int) -> tuple[str | None, str]:
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+    except httpx.HTTPError as exc:
+        return None, f"{exc.__class__.__name__}: {str(exc)[:120]}"
+    text = r.text
+    if "/cdn-cgi/trace" in url:
+        text = next((line[3:] for line in text.splitlines() if line.startswith("ip=")), "")
+    ip = _valid(text, version)
+    return (ip, "ok") if ip else (None, f"keine gültige öffentliche IPv{version} in der Antwort ({text.strip()[:40]!r})")
+
+
+def _ip_client() -> httpx.AsyncClient:
+    # trust_env=False: a proxy configured for the container must not change which IP we see.
+    return httpx.AsyncClient(timeout=6.0, trust_env=False, headers={"User-Agent": "DomainManager-DDNS/1.0"})
+
+
 async def detect_ip(version: int) -> tuple[str | None, str]:
     errors = []
-    async with httpx.AsyncClient(timeout=6.0, headers={"User-Agent": "DomainManager-DDNS/1.0"}) as client:
+    async with _ip_client() as client:
         for url in PROVIDERS[version]:
-            try:
-                r = await client.get(url)
-                r.raise_for_status()
-            except httpx.HTTPError as exc:
-                errors.append(exc.__class__.__name__)
-                continue
-            text = r.text
-            if "/cdn-cgi/trace" in url:
-                text = next((line[3:] for line in text.splitlines() if line.startswith("ip=")), "")
-            ip = _valid(text, version)
+            ip, info = await probe_provider(client, url, version)
             if ip:
                 return ip, url
-            errors.append("ungültige Antwort")
-    return None, ", ".join(dict.fromkeys(errors)) or "keine Antwort"
+            errors.append(f"{url.split('/')[2]}: {info}")
+    return None, " | ".join(errors) or "keine Antwort"
 
 
 # ------------------------------------------------------------------ notifications
@@ -155,13 +165,41 @@ async def notify(text: str) -> None:
 class Updater:
     def __init__(self) -> None:
         self.state: dict = {"ip": {}, "ip_error": {}, "ip_source": {}, "last_run": None, "next_run": None,
-                            "running": False, "hosts": {}, "error": None}
+                            "running": False, "hosts": {}, "error": None, "log": [], "loop_alive": None,
+                            "loop_error": None}
         self._wake = asyncio.Event()
         self._lock = asyncio.Lock()
         self._task: asyncio.Task | None = None
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(self._loop_ended)
+
+    def _loop_ended(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        self.state["loop_error"] = repr(exc)
+        print(f"DDNS: Hintergrund-Schleife beendet: {exc!r}", flush=True)
+
+    def ensure_running(self) -> None:
+        """Watchdog: restart the loop if it died for any reason."""
+        if self._task is None or self._task.done():
+            print("DDNS: Schleife lief nicht – starte neu", flush=True)
+            self.start()
+
+    def health(self) -> str:
+        if not store.data["enabled"]:
+            return "paused"
+        if not any(h.get("enabled", True) for h in store.hosts.values()):
+            return "no_hosts"
+        interval = max(60, int(store.data.get("interval") or settings.ddns_interval))
+        last = self.state["last_run"]
+        if self._task is None or self._task.done() or (last and time.time() - last > 2 * interval + 120):
+            return "stalled"
+        if self.state["error"] or self.state["ip_error"]:
+            return "error"
+        return "ok" if last else "starting"
 
     async def stop(self) -> None:
         if self._task:
@@ -172,7 +210,9 @@ class Updater:
 
     async def _loop(self) -> None:
         await asyncio.sleep(3)
+        print("DDNS: Updater gestartet", flush=True)
         while True:
+            self.state["loop_alive"] = time.time()
             if store.data["enabled"]:
                 try:
                     await self.run_once()
@@ -205,11 +245,26 @@ class Updater:
     async def run_once(self, reason: str = "auto") -> None:
         async with self._lock:
             self.state["running"] = True
+            self._entry = {"ts": time.time(), "reason": reason, "ip": {}, "changes": [], "errors": [], "unchanged": 0}
             try:
                 await self._run(reason)
+            except Exception as exc:
+                self._entry["errors"].append(f"Interner Fehler: {exc!r}")
+                raise
             finally:
                 self.state["running"] = False
                 self.state["last_run"] = time.time()
+                self._finish_entry()
+
+    def _finish_entry(self) -> None:
+        e = self._entry
+        e["ip"] = {str(k): v for k, v in self.state["ip"].items()}
+        for v, err in self.state["ip_error"].items():
+            e["errors"].append(f"IPv{v} nicht ermittelbar: {err}")
+        self.state["log"] = ([e] + self.state["log"])[:50]
+        ips = ", ".join(f"IPv{k}={v}" for k, v in e["ip"].items()) or "keine IP"
+        print(f"DDNS [{e['reason']}]: {ips}; {len(e['changes'])} geändert, {e['unchanged']} aktuell, "
+              f"{len(e['errors'])} Fehler" + "".join(f"\n  - {x}" for x in e["changes"] + e["errors"]), flush=True)
 
     async def _run(self, reason: str) -> None:
         await self.refresh_ips()
@@ -218,6 +273,7 @@ class Updater:
         self.state["error"] = None
         hosts = {n: h for n, h in store.hosts.items() if h.get("enabled", True)}
         if not hosts:
+            self._entry["errors"].append("Keine aktiven Hosts – nichts zu tun (DDNS → Importieren/Hinzufügen)")
             return
         changed: list[str] = []
         records_by_zone: dict[str, list[dict]] = {}
@@ -253,6 +309,8 @@ class Updater:
                         status["msgs"].append(f"{rtype} {action}")
                     if len(existing) > 1:
                         status["msgs"].append(f"{len(existing)} {rtype}-Records – nur der erste wird gepflegt")
+                if maintained and not any("angelegt" in m or "aktualisiert" in m for m in status["msgs"]) and status["ok"]:
+                    self._entry["unchanged"] += 1
                 if not maintained:
                     status["ok"] = False
                     status["msgs"].append("Nichts zu pflegen – benötigte IP-Version ist global deaktiviert")
@@ -260,7 +318,11 @@ class Updater:
                     status["msgs"].append("aktuell")
             except (CloudflareError, UpdaterError) as exc:
                 status["ok"] = False
-                status["msgs"].append(str(exc))
+                hint = " → API-Token braucht „Zone → DNS → Edit“" if getattr(exc, "status", 0) == 403 else ""
+                status["msgs"].append(str(exc) + hint)
+            if not status["ok"]:
+                self._entry["errors"].append(f"{name}: {' · '.join(status['msgs'])}")
+        self._entry["changes"] = changed
         if changed:
             audit.log("ddns_sync", "", reason=reason, changes=changed)
         failed = [n for n, s in self.state["hosts"].items() if n in hosts and not s["ok"]]
@@ -314,6 +376,38 @@ class Updater:
         if msgs:
             audit.log("ip_changed", "", changes=msgs)
             await notify("Neue öffentliche IP – " + "; ".join(msgs))
+
+
+    async def diagnose(self) -> dict:
+        """Check every IP provider and the Cloudflare token, including a no-op write test."""
+        out: dict = {"providers": [], "cloudflare": {}, "write_test": None}
+        async with _ip_client() as client:
+            for v in (4, 6):
+                for url in PROVIDERS[v]:
+                    ip, info = await probe_provider(client, url, v)
+                    out["providers"].append({"version": v, "url": url, "ip": ip, "info": info})
+        try:
+            out["cloudflare"] = {"ok": True, **await cf.verify()}
+            zones = await cf.zones()
+            out["cloudflare"]["zones"] = [z["name"] for z in zones]
+        except CloudflareError as exc:
+            out["cloudflare"] = {"ok": False, "error": str(exc)}
+            return out
+        # Re-save an existing record with identical content: proves 'DNS: Edit' without changing anything.
+        for name in sorted(store.hosts):
+            zone = await cf.zone_for(name)
+            if not zone:
+                continue
+            cf.forget_records(zone["id"])
+            rec = next((r for r in await cf.records(zone["id"]) if r["name"] == name and r["type"] in ("A", "AAAA")), None)
+            if rec:
+                try:
+                    await cf.update_record(zone["id"], rec["id"], content=rec["content"])
+                    out["write_test"] = {"ok": True, "record": f"{rec['type']} {name}"}
+                except CloudflareError as exc:
+                    out["write_test"] = {"ok": False, "record": f"{rec['type']} {name}", "error": str(exc)}
+                break
+        return out
 
 
 updater = Updater()

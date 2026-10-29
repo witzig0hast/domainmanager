@@ -228,3 +228,10 @@ textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--border-strong
 .settings-grid { display: grid; gap: 18px 24px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
 .settings-grid > label > span { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
 .cycle { flex: 1; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.login .btn.sso { margin-bottom: 4px; }
+.login form .btn { width: 100%; justify-content: center; height: 40px; }
+.divider { display: flex; align-items: center; gap: 12px; color: var(--faint); font-size: 12px; margin: 16px 0; }
+.divider::before, .divider::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.err-line { color: var(--red); }
+.modal h3 { font-size: 14px; margin: 18px 0 8px; }
+.modal h3:first-child { margin-top: 0; }

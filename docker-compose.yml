@@ -36,9 +36,19 @@ services:
       TLS_HOSTNAMES: ${TLS_HOSTNAMES:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-true}
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
-      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-30}
-      SESSION_MAX_HOURS: ${SESSION_MAX_HOURS:-8}
-    secrets: [admin_password_hash, totp_secret, cf_api_token, npm_password]
+      SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-720}
+      SESSION_MAX_HOURS: ${SESSION_MAX_HOURS:-168}
+      SESSION_BIND_IP: ${SESSION_BIND_IP:-false}
+      LOCAL_LOGIN: ${LOCAL_LOGIN:-true}
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:-Authentik}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
+      OIDC_ALLOWED_GROUPS: ${OIDC_ALLOWED_GROUPS:-}
+      OIDC_ALLOWED_USERS: ${OIDC_ALLOWED_USERS:-}
+      OIDC_VERIFY_TLS: ${OIDC_VERIFY_TLS:-true}
+    secrets: [admin_password_hash, totp_secret, cf_api_token, npm_password, oidc_client_secret]
     volumes:
       - dm-data:/data
       # Optional, read-only: your old favonia/CloudflareDNS folder for the one-time import.
@@ -49,7 +59,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks: [dm]
-    mem_limit: 256m
+    mem_limit: 384m
     cpus: 1.0
     pids_limit: 128
     logging:
@@ -70,6 +80,8 @@ secrets:
     file: ./secrets/cf_api_token
   npm_password:
     file: ./secrets/npm_password
+  oidc_client_secret:
+    file: ./secrets/oidc_client_secret
 
 volumes:
   dm-data:

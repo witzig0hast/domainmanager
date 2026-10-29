@@ -102,7 +102,7 @@ function toast(msg, kind = "") {
   setTimeout(() => t.remove(), kind === "error" ? 7000 : 4000);
 }
 
-function modal({ title, body, confirmText = "OK", danger = false, wide = false, onConfirm }) {
+function modal({ title, body, confirmText = "OK", danger = false, wide = false, cancel = true, onConfirm }) {
   const close = () => ov.remove();
   const btn = h("button", { class: "btn " + (danger ? "danger solid" : "primary") }, confirmText);
   btn.addEventListener("click", async () => {
@@ -113,7 +113,7 @@ function modal({ title, body, confirmText = "OK", danger = false, wide = false, 
     h("div", { class: "modal" + (wide ? " wide" : ""), role: "dialog", "aria-modal": "true" },
       h("div", { class: "card-head" }, h("h2", {}, title)),
       h("div", { class: "card-body" }, body),
-      h("div", { class: "card-foot" }, h("span", { class: "spacer" }), h("button", { class: "btn", onclick: close }, "Abbrechen"), btn)));
+      h("div", { class: "card-foot" }, h("span", { class: "spacer" }), cancel ? h("button", { class: "btn", onclick: close }, "Abbrechen") : null, btn)));
   document.body.append(ov);
   const first = ov.querySelector("input");
   (first || btn).focus();
@@ -127,12 +127,16 @@ function loading() { return h("div", { class: "card" }, h("div", { class: "card-
 function renderLogin(notice) {
   stopPoll();
   const s = state.sessionInfo || {};
+  const oidc = s.oidc || {};
   const err = h("div", { class: "alert error hidden" });
+  const showError = (msg) => { err.replaceChildren(msg); err.classList.remove("hidden"); };
   const user = h("input", { type: "text", name: "username", autocomplete: "username", required: true, maxlength: "64" });
   const pass = h("input", { type: "password", name: "password", autocomplete: "current-password", required: true, maxlength: "256" });
   const otp = h("input", { type: "text", name: "otp", autocomplete: "one-time-code", inputmode: "numeric", pattern: "[0-9 ]*", maxlength: "10" });
   const btn = h("button", { class: "btn primary", type: "submit" }, "Anmelden");
-  const form = h("form", { class: "card-body", onsubmit: async (e) => {
+  const sso = oidc.enabled ? h("button", { class: "btn primary sso", type: "button",
+    onclick: () => { location.assign("/api/oidc/login"); } }, icon("shield"), `Mit ${oidc.name} anmelden`) : null;
+  const form = s.login_enabled ? h("form", { onsubmit: async (e) => {
     e.preventDefault();
     btn.disabled = true;
     err.classList.add("hidden");
@@ -141,24 +145,30 @@ function renderLogin(notice) {
       pass.value = "";
       await boot();
     } catch (ex) {
-      err.replaceChildren(ex.message);
-      err.classList.remove("hidden");
+      showError(ex.message);
       pass.value = ""; otp.value = "";
     } finally { btn.disabled = false; }
   } },
-    notice ? h("div", { class: "alert info" }, notice) : null,
-    s.login_enabled === false ? h("div", { class: "alert warn" }, h("div", {}, h("b", {}, "Login deaktiviert"), "Es ist kein ADMIN_PASSWORD_HASH konfiguriert. Siehe README.")) : null,
-    err,
     h("label", { class: "field" }, h("span", {}, "Benutzername"), user),
     h("label", { class: "field" }, h("span", {}, "Passwort"), pass),
     s.totp ? h("label", { class: "field" }, h("span", {}, "2FA-Code"), otp) : null,
-    btn);
+    sso ? h("button", { class: "btn", type: "submit" }, "Mit Passwort anmelden") : btn) : null;
+  const body = h("div", { class: "card-body" },
+    notice ? h("div", { class: "alert info" }, notice) : null,
+    !s.login_enabled && !oidc.enabled ? h("div", { class: "alert warn" }, h("div", {}, h("b", {}, "Login deaktiviert"), "Weder ADMIN_PASSWORD_HASH noch SSO (OIDC_*) ist konfiguriert. Siehe README.")) : null,
+    err, sso, sso && form ? h("div", { class: "divider" }, "oder") : null, form);
+  // Errors from the SSO callback arrive as ?login_error=… – show once, then clean the URL.
+  const params = new URLSearchParams(location.search);
+  if (params.get("login_error")) {
+    showError(params.get("login_error"));
+    history.replaceState(null, "", location.pathname + location.hash);
+  }
   document.getElementById("app").replaceChildren(
     h("div", { class: "login-wrap" }, h("div", { class: "login" },
       h("div", { class: "brand" }, logo(), "DomainManager"),
-      h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Anmelden")), form),
+      h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Anmelden")), body),
       h("div", { class: "foot" }, "Zugriff wird protokolliert."))));
-  user.focus();
+  if (form) user.focus();
 }
 
 // ------------------------------------------------------------------ shell
@@ -230,8 +240,8 @@ async function viewOverview(page) {
       cfS.ok ? (cfS.type === "token" ? "API-Token aktiv" : "Global API Key – besser einen eingeschränkten Token verwenden!") : cfS.error),
     stat("Ollama", ol.ok ? (ol.default_available ? "ok" : "warn") : "bad", ol.ok ? `${ol.models} Modelle` : "Nicht erreichbar",
       ol.ok ? (ol.default_available ? `Standard: ${ol.default_model}` : `Standardmodell ${ol.default_model} fehlt`) : `${ol.url} – ${ol.error}`),
-    stat("DDNS-Updater", !dd.enabled ? "warn" : dd.error ? "bad" : "ok",
-      !dd.enabled ? "Pausiert" : dd.error ? "Fehler" : `${dd.hosts} Hosts aktuell`,
+    stat("DDNS-Updater", (HEALTH[dd.health] || HEALTH.error)[2],
+      dd.health === "ok" ? `${dd.hosts} Hosts aktuell` : (HEALTH[dd.health] || HEALTH.error)[1],
       [dd.error, ipText || "Öffentliche IP noch nicht ermittelt", dd.last_run ? `Letzter Lauf ${fmtTime(dd.last_run)}` : null].filter(Boolean).join(" · ")),
     stat("Nginx Proxy Manager", !st.npm.configured ? "warn" : st.npm.error ? "bad" : st.npm.unused ? "warn" : "ok",
       !st.npm.configured ? "Nicht verbunden" : st.npm.error ? "Fehler" : st.npm.unused ? `${st.npm.unused} ungenutzte Subdomains` : "Alles genutzt",
@@ -320,6 +330,10 @@ function confirmDeleteRecord(zone, r, after) {
 }
 
 // ------------------------------------------------------------------ ddns
+const HEALTH = {
+  ok: ["sev-ok", "Aktiv", "ok"], starting: ["sev-low", "Startet…", "warn"], paused: ["sev-medium", "Pausiert", "warn"],
+  no_hosts: ["sev-medium", "Keine Hosts", "warn"], stalled: ["sev-high", "Hängt – siehe Diagnose", "bad"], error: ["sev-high", "Fehler", "bad"],
+};
 const TTL_LABEL = (t) => (t === 1 ? "Auto" : t < 60 ? `${t} s` : t < 3600 ? `${t / 60} min` : `${t / 3600} h`);
 const fmtAgo = (ts) => {
   if (!ts) return "–";
@@ -375,8 +389,10 @@ async function viewDdns(page) {
   };
   const statusCard = h("div", { class: "card" },
     h("div", { class: "card-head" }, h("h2", {}, "DDNS-Updater"),
-      h("span", { class: "badge " + (!s.enabled ? "sev-medium" : st.error ? "sev-high" : "sev-ok") }, !s.enabled ? "Pausiert" : st.error ? st.error : "Aktiv"),
-      h("div", { class: "right" }, toggle(s.enabled, (val) => saveSettings({ enabled: val }), s.enabled ? "Ein" : "Aus"), intervalSel, runBtn)),
+      h("span", { class: "badge " + (HEALTH[st.health] || HEALTH.error)[0] }, (HEALTH[st.health] || HEALTH.error)[1]),
+      st.error && st.health !== "paused" ? h("span", { class: "sub" }, st.error) : null,
+      h("div", { class: "right" }, toggle(s.enabled, (val) => saveSettings({ enabled: val }), s.enabled ? "Ein" : "Aus"), intervalSel, runBtn,
+        h("button", { class: "btn", onclick: diagnoseDialog }, "Diagnose"))),
     h("div", { class: "card-body ddns-status" },
       h("div", {}, h("div", { class: "label" }, "Öffentliche IP"), ipLine(4), ipLine(6)),
       h("div", {}, h("div", { class: "label" }, "Letzter Lauf"), h("div", {}, fmtAgo(st.last_run))),
@@ -439,6 +455,21 @@ async function viewDdns(page) {
       h("tbody", {}, rows.length ? rows : h("tr", {}, h("td", { colspan: "8", class: "empty" },
         "Noch keine Hosts. Über „Importieren“ deine Subdomains aus favonia übernehmen oder oben einzeln hinzufügen."))))));
 
+  const logCard = h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Protokoll"), h("span", { class: "sub" }, "Die letzten Läufe – auch in „docker compose logs“")),
+    d.log.length ? h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Zeit"), h("th", {}, "Auslöser"), h("th", {}, "IP"), h("th", {}, "Ergebnis"))),
+      h("tbody", {}, d.log.map((e) => h("tr", {},
+        h("td", { class: "nowrap small" }, fmtTime(e.ts)),
+        h("td", { class: "small" }, e.reason === "manual" ? "manuell" : "automatisch"),
+        h("td", { class: "mono small" }, Object.entries(e.ip).map(([v, ip]) => `v${v} ${ip}`).join(" · ") || "–"),
+        h("td", { class: "small" },
+          h("div", {}, h("span", { class: "dot " + (e.errors.length ? "bad" : "ok") }), " ",
+            `${e.changes.length} geändert · ${e.unchanged} aktuell · ${e.errors.length} Fehler`),
+          e.changes.map((x) => h("div", { class: "muted" }, "✎ " + x)),
+          e.errors.map((x) => h("div", { class: "err-line" }, "✕ " + x))))))))
+      : h("div", { class: "empty" }, s.enabled ? "Noch kein Lauf seit dem Start." : "Updater ist pausiert."));
+
   const historyCard = h("div", { class: "card" },
     h("div", { class: "card-head" }, h("h2", {}, "IP-Verlauf"), h("span", { class: "sub" }, "Wechsel deiner öffentlichen IP")),
     d.history.length ? h("div", { class: "table-wrap" }, h("table", {},
@@ -456,7 +487,28 @@ async function viewDdns(page) {
       h("code", {}, "docker compose down"), " im CloudflareDNS-Ordner) · 3. hier einschalten. Laufen beide gleichzeitig, setzt favonia seine Proxy-Einstellungen zurück.")) : null,
     s.enabled && st.ip_error && st.ip_error["6"] && s.ipv6 ? h("div", { class: "alert warn" }, h("div", {}, h("b", {}, "IPv6 nicht ermittelbar"),
       "Der Container hat kein IPv6. Entweder IPv6 hier ausschalten oder im Docker-Netz aktivieren (siehe README).")) : null,
-    statusCard, hostCard, historyCard);
+    statusCard, hostCard, logCard, historyCard);
+}
+
+async function diagnoseDialog() {
+  const box = h("div", {}, h("div", { class: "progress indeterminate" }, h("div")), h("p", { class: "small muted" }, "Prüfe IP-Dienste und Cloudflare … (bis zu 30 s)"));
+  modal({ title: "DDNS-Diagnose", wide: true, cancel: false, confirmText: "Schließen", onConfirm: () => true, body: box });
+  try {
+    const d = await api("/api/ddns/diagnose", { method: "POST" });
+    const ok = (b) => h("span", { class: "dot " + (b ? "ok" : "bad") });
+    const cfd = d.cloudflare;
+    put(box,
+      h("h3", {}, "Öffentliche IP"),
+      h("div", { class: "table-wrap import-table" }, h("table", {}, h("tbody", {}, d.providers.map((p) => h("tr", {},
+        h("td", {}, ok(!!p.ip)), h("td", { class: "small" }, `IPv${p.version}`), h("td", { class: "mono small" }, p.url),
+        h("td", { class: "small" }, p.ip ? h("code", {}, p.ip) : h("span", { class: "err-line" }, p.info))))))),
+      h("p", { class: "small muted" }, "Schlagen alle IPv4-Dienste fehl, hat der Container keinen Internetzugang (Firewall, DNS, Docker-Netz). IPv6-Fehler sind normal, solange IPv6 im Docker-Netz nicht aktiviert ist."),
+      h("h3", {}, "Cloudflare"),
+      h("p", {}, ok(cfd.ok), " ", cfd.ok ? `Token gültig (${cfd.type}) · Zonen: ${(cfd.zones || []).join(", ") || "keine"}` : cfd.error),
+      d.write_test ? h("p", {}, ok(d.write_test.ok), " Schreibtest an ", h("code", {}, d.write_test.record), " (ohne Änderung): ",
+        d.write_test.ok ? "erlaubt" : h("span", { class: "err-line" }, `${d.write_test.error} → Token braucht „Zone → DNS → Edit“`))
+        : cfd.ok ? h("p", { class: "small muted" }, "Kein Schreibtest möglich – es gibt noch keinen bestehenden A/AAAA-Record eines verwalteten Hosts.") : null);
+  } catch (e) { put(box, errorBox(e)); }
 }
 
 function confirmRemoveHost(host, after) {
@@ -877,7 +929,7 @@ async function showHostFindings(name) {
   try {
     const r = await api(`/api/schedule/host?name=${encodeURIComponent(name)}`);
     const list = r.findings.filter((f) => f.severity !== "info");
-    modal({ title: `${name} · Score ${r.score}`, wide: true, confirmText: "Schließen", onConfirm: () => true,
+    modal({ title: `${name} · Score ${r.score}`, wide: true, cancel: false, confirmText: "Schließen", onConfirm: () => true,
       body: [h("p", { class: "muted small" }, `Geprüft ${fmtTime(r.ts)}`),
         h("div", { class: "table-wrap import-table" }, h("table", {}, h("tbody", {}, list.length ? list.map((f) => h("tr", {}, h("td", {}, sevBadge(f.severity)),
           h("td", {}, h("b", {}, f.title), f.detail ? h("div", { class: "muted small" }, f.detail) : null), h("td", { class: "muted small" }, f.check)))
@@ -887,13 +939,27 @@ async function showHostFindings(name) {
 
 // ------------------------------------------------------------------ audit
 async function viewAudit(page) {
-  const entries = await api("/api/audit");
+  const [entries, sess] = await Promise.all([api("/api/audit"), api("/api/sessions")]);
+  const sessCard = h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Aktive Sitzungen"), h("span", { class: "sub" }, `${sess.length} angemeldet`),
+      sess.length > 1 ? h("div", { class: "right" }, h("button", { class: "btn sm danger", onclick: async () => {
+        try { const r = await api("/api/sessions/revoke-others", { method: "POST" }); toast(`${r.revoked} Sitzung(en) abgemeldet`, "ok"); renderView(); }
+        catch (e) { toast(e.message, "error"); }
+      } }, "Alle anderen abmelden")) : null),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Benutzer"), h("th", {}, "Anmeldung"), h("th", {}, "IP"), h("th", {}, "Gerät"), h("th", {}, "Seit"), h("th", {}, "Zuletzt aktiv"))),
+      h("tbody", {}, sess.map((x) => h("tr", {},
+        h("td", { class: "name" }, x.user, x.current ? [" ", h("span", { class: "badge sev-ok" }, "diese")] : null),
+        h("td", {}, x.method === "sso" ? "SSO" : "Passwort"), h("td", { class: "mono small" }, x.ip),
+        h("td", { class: "content small", title: x.agent }, x.agent || "–"),
+        h("td", { class: "nowrap small" }, fmtTime(x.created)), h("td", { class: "nowrap small" }, fmtAgo(x.last_seen))))))));
   const fmt = (e) => {
     const { ts, event, ip, ...rest } = e;
     return Object.entries(rest).map(([k, v]) => `${k}=${typeof v === "object" ? JSON.stringify(v) : v}`).join("  ");
   };
   put(page, pageHead("Audit-Log", "Anmeldungen und alle Änderungen. Gespeichert in /data/audit.log.",
     h("button", { class: "btn", onclick: () => renderView() }, icon("refresh"), "Aktualisieren")),
+    sessCard,
     h("div", { class: "card" }, h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, h("th", {}, "Zeit"), h("th", {}, "Ereignis"), h("th", {}, "IP"), h("th", {}, "Details"))),
       h("tbody", {}, entries.length ? entries.map((e) => h("tr", {},

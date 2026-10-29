@@ -1,6 +1,7 @@
-"""Single-admin authentication: Argon2id password, optional TOTP, server-side sessions."""
+"""Authentication: Argon2id password with optional TOTP (or SSO, see oidc.py) and persistent server-side sessions."""
 from __future__ import annotations
 
+import hashlib
 import hmac
 import secrets
 import threading
@@ -12,6 +13,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 
 from .config import settings
+from .jsonstore import JsonStore
 
 _hasher = PasswordHasher()
 # Verified against when the username is wrong so timing doesn't reveal it.
@@ -26,43 +28,101 @@ class Session:
     csrf: str
     user: str
     ip: str
+    method: str = "password"
+    agent: str = ""
     created: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
 
 
+def _key(token: str) -> str:
+    # Only a hash of the token is stored on disk, so a leaked sessions.json can't be replayed.
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 class SessionStore:
-    """In-memory sessions: a container restart logs everyone out, which is intended."""
+    """Server-side sessions, persisted in /data so a container restart doesn't log anyone out."""
+
+    MAX_SESSIONS = 20
+    PERSIST_EVERY = 120  # seconds between last_seen writes
 
     def __init__(self) -> None:
-        self._sessions: dict[str, Session] = {}
         self._lock = threading.Lock()
+        self._store = JsonStore("sessions.json", {"sessions": {}})
+        self._sessions: dict[str, dict] = self._store.data["sessions"]
+        self._last_persist = 0.0
+        self._prune(time.time())
 
-    def create(self, user: str, ip: str) -> Session:
-        s = Session(token=secrets.token_urlsafe(32), csrf=secrets.token_urlsafe(32), user=user, ip=ip)
+    def _expired(self, s: dict, now: float) -> bool:
+        return (now - s["last_seen"] > settings.session_idle_minutes * 60
+                or now - s["created"] > settings.session_max_hours * 3600)
+
+    def _prune(self, now: float) -> None:
+        for k in [k for k, s in self._sessions.items() if self._expired(s, now)]:
+            del self._sessions[k]
+
+    def _persist(self) -> None:
+        self._last_persist = time.time()
+        try:
+            self._store.save()
+        except OSError as exc:
+            print(f"sessions not persisted: {exc!r}", flush=True)
+
+    def create(self, user: str, ip: str, method: str = "password", agent: str = "") -> Session:
+        s = Session(token=secrets.token_urlsafe(32), csrf=secrets.token_urlsafe(32), user=user, ip=ip,
+                    method=method, agent=agent[:120])
         with self._lock:
-            # Single admin: a fresh login invalidates all older sessions.
-            self._sessions = {s.token: s}
+            now = time.time()
+            self._prune(now)
+            while len(self._sessions) >= self.MAX_SESSIONS:
+                oldest = min(self._sessions, key=lambda k: self._sessions[k]["last_seen"])
+                del self._sessions[oldest]
+            data = {k: v for k, v in s.__dict__.items() if k != "token"}
+            self._sessions[_key(s.token)] = data
+            self._persist()
         return s
 
-    def get(self, token: str | None) -> Session | None:
+    def get(self, token: str | None, ip: str) -> Session | None:
         if not token:
             return None
         now = time.time()
         with self._lock:
-            s = self._sessions.get(token)
-            if s is None:
+            key = _key(token)
+            data = self._sessions.get(key)
+            if data is None:
                 return None
-            if (now - s.last_seen > settings.session_idle_minutes * 60
-                    or now - s.created > settings.session_max_hours * 3600):
-                del self._sessions[token]
+            if self._expired(data, now):
+                del self._sessions[key]
+                self._persist()
                 return None
-            s.last_seen = now
-            return s
+            if settings.session_bind_ip and data["ip"] != ip:
+                return None
+            data["last_seen"] = now
+            data["ip"] = ip
+            if now - self._last_persist > self.PERSIST_EVERY:
+                self._persist()
+            return Session(token=token, **data)
 
     def destroy(self, token: str | None) -> None:
         if token:
             with self._lock:
-                self._sessions.pop(token, None)
+                if self._sessions.pop(_key(token), None) is not None:
+                    self._persist()
+
+    def list(self, current: str | None) -> list[dict]:
+        cur = _key(current) if current else None
+        with self._lock:
+            return sorted(({"id": k[:12], "current": k == cur, **{f: v[f] for f in
+                            ("user", "ip", "method", "agent", "created", "last_seen")}}
+                           for k, v in self._sessions.items()), key=lambda x: -x["last_seen"])
+
+    def destroy_others(self, current: str) -> int:
+        cur = _key(current)
+        with self._lock:
+            others = [k for k in self._sessions if k != cur]
+            for k in others:
+                del self._sessions[k]
+            self._persist()
+            return len(others)
 
 
 sessions = SessionStore()

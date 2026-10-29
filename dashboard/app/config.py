@@ -77,11 +77,29 @@ class Settings:
     allowed_networks: list = field(default_factory=lambda: _networks(_env("ALLOWED_NETWORKS", DEFAULT_ALLOWED)))
 
     cookie_secure: bool = field(default_factory=lambda: _bool("COOKIE_SECURE", True))
-    session_idle_minutes: int = field(default_factory=lambda: _int("SESSION_IDLE_MINUTES", 30))
-    session_max_hours: int = field(default_factory=lambda: _int("SESSION_MAX_HOURS", 8))
+    session_idle_minutes: int = field(default_factory=lambda: _int("SESSION_IDLE_MINUTES", 720))
+    session_max_hours: int = field(default_factory=lambda: _int("SESSION_MAX_HOURS", 168))
+    # Binding a session to the client IP logs you out whenever the browser switches between IPv4 and IPv6.
+    session_bind_ip: bool = field(default_factory=lambda: _bool("SESSION_BIND_IP", False))
+
+    local_login: bool = field(default_factory=lambda: _bool("LOCAL_LOGIN", True))
+    oidc_issuer: str = field(default_factory=lambda: _env("OIDC_ISSUER_URL").rstrip("/"))
+    oidc_client_id: str = field(default_factory=lambda: _env("OIDC_CLIENT_ID"))
+    oidc_client_secret: str = field(default_factory=lambda: _secret("OIDC_CLIENT_SECRET"))
+    oidc_name: str = field(default_factory=lambda: _env("OIDC_PROVIDER_NAME", "Authentik"))
+    oidc_redirect_uri: str = field(default_factory=lambda: _env("OIDC_REDIRECT_URI"))
+    oidc_allowed_groups: tuple[str, ...] = field(default_factory=lambda: tuple(
+        g.strip() for g in _env("OIDC_ALLOWED_GROUPS").split(",") if g.strip()))
+    oidc_allowed_users: tuple[str, ...] = field(default_factory=lambda: tuple(
+        u.strip().lower() for u in _env("OIDC_ALLOWED_USERS").split(",") if u.strip()))
+    oidc_verify_tls: bool = field(default_factory=lambda: _bool("OIDC_VERIFY_TLS", True))
 
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA_DIR", "/data")))
     max_scan_hosts: int = field(default_factory=lambda: _int("MAX_SCAN_HOSTS", 25))
+
+    @property
+    def oidc_enabled(self) -> bool:
+        return bool(self.oidc_issuer and self.oidc_client_id and self.oidc_client_secret)
 
     @property
     def cf_configured(self) -> bool:

@@ -25,7 +25,8 @@ Selbst gehostetes Dashboard im Cloudflare-Look für dein Homelab – **ein einzi
 |---|---|
 | Netzwerk | Lauscht standardmäßig nur auf `127.0.0.1`; IP-Allowlist (`ALLOWED_NETWORKS`, Default nur private Netze); HTTPS ab Werk (selbstsigniertes Zertifikat) |
 | Login | Argon2id-Passwort-Hash, optional TOTP-2FA (mit Replay-Schutz), Lockout nach 5 Fehlversuchen/IP + globales Limit |
-| Sitzung | Zufälliges Server-Session-Token, Cookie `HttpOnly; Secure; SameSite=Strict`, an Client-IP gebunden, 30 min Idle / 8 h max., nur eine aktive Sitzung |
+| Login | Optional **SSO über Authentik** (OpenID Connect, Code-Flow mit PKCE, Prüfung von Issuer/Audience/Nonce, Zugriff nur für bestimmte Gruppen); Passwort-Login abschaltbar |
+| Sitzung | Zufälliges Session-Token, Cookie `HttpOnly; Secure; SameSite=Strict`; serverseitig nur als SHA-256-Hash gespeichert, übersteht Neustarts; 12 h Inaktivität / 7 Tage max. (einstellbar); mehrere Geräte, „Alle anderen abmelden“ |
 | Requests | CSRF-Token für alle schreibenden Requests + Origin-Prüfung, Body-Limit 64 KB, keine OpenAPI/Docs-Endpunkte |
 | Browser | Strikte CSP (`default-src 'none'`, kein Inline-JS), `X-Frame-Options: DENY`, `no-referrer`, kein `innerHTML` mit Daten |
 | Container | Read-only Root-FS, `cap_drop: ALL`, `no-new-privileges`, Non-Root, Memory/PID-Limits, **kein Docker-Socket**, Secrets als Docker Secrets |
@@ -68,7 +69,7 @@ Cloudflare → *My Profile → API Tokens → Create Token → Custom token*:
 git clone https://github.com/witzig0hast/domainmanager.git && cd domainmanager
 cp .env.example .env && nano .env        # OLLAMA_URL, BIND_ADDR, TLS_HOSTNAMES, DDNS_IMPORT_DIR …
 
-touch secrets/admin_password_hash secrets/totp_secret secrets/npm_password
+touch secrets/admin_password_hash secrets/totp_secret secrets/npm_password secrets/oidc_client_secret
 printf '%s' 'DEIN_CLOUDFLARE_TOKEN' > secrets/cf_api_token
 
 docker compose build
@@ -92,6 +93,20 @@ docker compose up -d && docker compose logs -f
 Aufruf: `https://<BIND_ADDR>:8443` – das selbstsignierte Zertifikat einmalig akzeptieren. Trag die LAN-IP/den Namen in `TLS_HOSTNAMES` ein, **bevor** du das erste Mal startest.
 
 **Hinter einem Reverse-Proxy** (Traefik/NPM/Caddy): `TLS_MODE=off`, `TRUSTED_PROXIES=<Proxy-IP>`, `BIND_ADDR` auf eine Adresse, die nur der Proxy erreicht. **Nie** ohne zusätzlichen Schutz (Cloudflare Access/VPN) ins Internet stellen.
+
+## SSO mit Authentik
+
+1. Authentik → *Applications → Create with Provider* → **OAuth2/OpenID Provider**:
+   - Client type: **Confidential**
+   - Redirect URI (strict): `https://<dashboard-adresse>:8443/api/oidc/callback` – genau die Adresse, mit der du das Dashboard im Browser öffnest
+   - Scopes: `openid`, `email`, `profile` (Standard; `profile` liefert die Gruppen)
+   - Signing Key: beliebig
+2. In Authentik eine Gruppe `domainmanager-admins` anlegen, dich hinzufügen und die Application optional per *Policy/Group Binding* auf diese Gruppe beschränken.
+3. In `.env`: `OIDC_ISSUER_URL` (aus dem Provider, „OpenID Configuration Issuer“, z. B. `https://auth.example.org/application/o/domainmanager/`), `OIDC_CLIENT_ID`, `OIDC_ALLOWED_GROUPS=domainmanager-admins`. Das Client-Secret in `secrets/oidc_client_secret` (`chown 10001:10001`, `chmod 400`).
+4. `docker compose up -d` → auf der Login-Seite erscheint **„Mit Authentik anmelden“**.
+5. Klappt das, `LOCAL_LOGIN=false` setzen – dann gibt es nur noch SSO.
+
+Fehler beim SSO-Login werden auf der Login-Seite angezeigt und im Audit-Log protokolliert. Häufigste Ursache: Redirect-URI in Authentik stimmt nicht exakt (Port, `https`). Dann `OIDC_REDIRECT_URI` setzen und in Authentik identisch eintragen.
 
 ## Umstieg von favonia/cloudflare-ddns
 
@@ -142,6 +157,19 @@ Seite **Wochen-Scan**: Zeitraum (z. B. *7 Tage*), Abstand der Blöcke (z. B. *al
 - **Neuer Host:** Name eintragen → *Hinzufügen*. Gibt es noch keinen Record, wird er beim nächsten Lauf angelegt (Kommentar „DomainManager DDNS“).
 - **Benachrichtigung:** `NOTIFY_URL=https://ntfy.sh/<geheimes-topic>` (oder ein ntfy-kompatibler Endpunkt) bzw. eine Discord-Webhook-URL.
 - **Sicherheitscheck:** Hosts wählen (Schnellwahl „Alle DDNS-Hosts“ / „Alle ohne Proxy“), Modell wählen, *Scan starten*. Geprüft werden u. a. SSL-Modus, Always-HTTPS, TLS-Version, HSTS, DNSSEC, SPF/DMARC/CAA, sichtbare Heim-IP, private IPs im DNS, verwaiste CNAMEs (Subdomain-Takeover), Zertifikat, HTTPS-Redirect, Security-Header und Versions-Leaks.
+
+## Fehlersuche
+
+**DDNS-Updater „läuft, macht aber nichts“** – DDNS-Seite öffnen:
+
+- Der Status oben sagt jetzt genau, was los ist: *Aktiv*, *Pausiert*, *Keine Hosts*, *Fehler* oder *Hängt*.
+- **Protokoll**: jeder Lauf mit ermittelter IP, Änderungen und Fehlern. Dieselben Zeilen stehen in `docker compose logs dashboard` (`DDNS [auto]: IPv4=…; 0 geändert, 3 aktuell, 0 Fehler`). „aktuell“ heißt: der Record stimmt bereits, es gibt nichts zu tun.
+- **Diagnose**: fragt jeden IP-Dienst einzeln ab, prüft den Cloudflare-Token und macht einen Schreibtest an einem bestehenden Record (ohne ihn zu ändern).
+  - Alle IPv4-Dienste schlagen fehl → der Container kommt nicht ins Internet (Firewall, DNS, Docker-Netz).
+  - Schreibtest „Authentication error“ → dem Token fehlt **Zone → DNS → Edit** (in älteren Anleitungen stand *Read*).
+  - Zonen-Liste leer → Token gilt nicht für deine Zone (*Zone Resources*).
+
+**Ständig abgemeldet**: Sitzungen überstehen jetzt Neustarts, gelten 12 h ohne Aktivität (`SESSION_IDLE_MINUTES`) und hängen nicht mehr an der IP (Wechsel IPv4↔IPv6 hatte vorher abgemeldet). Mehrere Geräte gleichzeitig sind erlaubt; unter *Audit-Log → Aktive Sitzungen* siehst du alle und kannst die anderen abmelden. Läuft das Dashboard hinter einem Reverse-Proxy, `TRUSTED_PROXIES` setzen.
 
 ## Wartung
 

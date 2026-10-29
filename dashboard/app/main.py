@@ -8,14 +8,14 @@ import secrets
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import audit, importer, ollama, usage
+from . import audit, importer, oidc, ollama, usage
 from .auth import SESSION_COOKIE, Session, limiter, sessions, verify_credentials
 from .cloudflare import CloudflareError, cf, valid_id
 from .config import settings
@@ -100,8 +100,8 @@ async def guard(request: Request, call_next):
 
 
 def require_session(request: Request) -> Session:
-    s = sessions.get(request.cookies.get(SESSION_COOKIE))
-    if s is None or s.ip != client_ip(request):
+    s = sessions.get(request.cookies.get(SESSION_COOKIE), client_ip(request))
+    if s is None:
         raise HTTPException(401, "Nicht angemeldet")
     if request.method not in SAFE_METHODS:
         token = request.headers.get("x-csrf-token", "")
@@ -135,12 +135,14 @@ class LoginIn(BaseModel):
 
 @app.get("/api/session")
 async def session_info(request: Request):
-    s = sessions.get(request.cookies.get(SESSION_COOKIE))
-    base = {"totp": bool(settings.totp_secret), "login_enabled": bool(settings.admin_password_hash)}
-    if s is None or s.ip != client_ip(request):
+    s = sessions.get(request.cookies.get(SESSION_COOKIE), client_ip(request))
+    base = {"totp": bool(settings.totp_secret),
+            "login_enabled": settings.local_login and bool(settings.admin_password_hash),
+            "oidc": {"enabled": settings.oidc_enabled, "name": settings.oidc_name}}
+    if s is None:
         return {"authenticated": False, **base}
     return {
-        "authenticated": True, "user": s.user, "csrf": s.csrf, **base,
+        "authenticated": True, "user": s.user, "csrf": s.csrf, "method": s.method, **base,
         "allow_dns_delete": settings.allow_dns_delete,
         "default_model": settings.ollama_model,
         "max_scan_hosts": settings.max_scan_hosts,
@@ -149,6 +151,8 @@ async def session_info(request: Request):
 
 @app.post("/api/login")
 async def login(body: LoginIn, request: Request):
+    if not settings.local_login:
+        raise HTTPException(403, "Passwort-Login ist deaktiviert – bitte per SSO anmelden")
     ip = client_ip(request)
     wait = limiter.blocked_for(ip)
     if wait:
@@ -160,12 +164,78 @@ async def login(body: LoginIn, request: Request):
         await asyncio.sleep(1)
         raise HTTPException(401, "Anmeldung fehlgeschlagen")
     limiter.success(ip)
-    s = sessions.create(body.user, ip)
+    s = sessions.create(body.user, ip, "password", request.headers.get("user-agent", ""))
     audit.log("login", ip, user=body.user)
-    resp = JSONResponse({"ok": True})
+    return _with_session(JSONResponse({"ok": True}), s)
+
+
+def _with_session(resp, s: Session):
     resp.set_cookie(SESSION_COOKIE, s.token, httponly=True, secure=settings.cookie_secure,
                     samesite="strict", path="/", max_age=settings.session_max_hours * 3600)
     return resp
+
+
+OIDC_COOKIE = "dm_oidc"
+
+
+def _redirect_uri(request: Request) -> str:
+    return settings.oidc_redirect_uri or str(request.url_for("oidc_callback"))
+
+
+def _login_error(message: str) -> RedirectResponse:
+    resp = RedirectResponse("/?" + urlencode({"login_error": message[:200]}), status_code=303)
+    resp.delete_cookie(OIDC_COOKIE, path="/api/oidc")
+    return resp
+
+
+@app.get("/api/oidc/login")
+async def oidc_login(request: Request):
+    if not settings.oidc_enabled:
+        raise HTTPException(404, "SSO ist nicht konfiguriert")
+    if limiter.blocked_for(client_ip(request)):
+        return _login_error("Zu viele Fehlversuche – bitte später erneut versuchen")
+    try:
+        url, browser = await oidc.begin(_redirect_uri(request))
+    except oidc.OidcError as exc:
+        return _login_error(str(exc))
+    resp = RedirectResponse(url, status_code=303)
+    # Lax (not Strict): the cookie must come along when the IdP redirects the browser back.
+    resp.set_cookie(OIDC_COOKIE, browser, httponly=True, secure=settings.cookie_secure, samesite="lax",
+                    path="/api/oidc", max_age=oidc.FLOW_TTL)
+    return resp
+
+
+@app.get("/api/oidc/callback", name="oidc_callback")
+async def oidc_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    ip = client_ip(request)
+    if not settings.oidc_enabled:
+        raise HTTPException(404, "SSO ist nicht konfiguriert")
+    if error or not code or not state:
+        return _login_error("Anmeldung beim SSO-Anbieter abgebrochen" if error else "Ungültige SSO-Antwort")
+    try:
+        ident = await oidc.complete(code[:2048], state[:256], request.cookies.get(OIDC_COOKIE, ""))
+    except oidc.OidcError as exc:
+        limiter.fail(ip)
+        audit.log("login_failed", ip, method="oidc", reason=str(exc))
+        return _login_error(str(exc))
+    limiter.success(ip)
+    s = sessions.create(ident["user"], ip, "sso", request.headers.get("user-agent", ""))
+    audit.log("login", ip, user=ident["user"], method="oidc", email=ident["email"])
+    resp = _with_session(RedirectResponse("/", status_code=303), s)
+    resp.delete_cookie(OIDC_COOKIE, path="/api/oidc")
+    return resp
+
+
+@app.get("/api/sessions")
+async def session_list(request: Request, _s: Session = Depends(require_session)):
+    return sessions.list(request.cookies.get(SESSION_COOKIE))
+
+
+@app.post("/api/sessions/revoke-others")
+async def session_revoke(request: Request, s: Session = Depends(require_session)):
+    n = sessions.destroy_others(s.token)
+    audit.log("sessions_revoked", client_ip(request), user=s.user, count=n)
+    return {"revoked": n}
 
 
 @app.post("/api/logout")
@@ -182,7 +252,9 @@ async def logout(request: Request, s: Session = Depends(require_session)):
 @app.get("/api/status")
 async def status(_s: Session = Depends(require_session)):
     st = updater.state
-    out: dict = {"ddns": {"enabled": store.data["enabled"], "hosts": len(store.hosts), "ip": st["ip"],
+    updater.ensure_running()
+    out: dict = {"ddns": {"enabled": store.data["enabled"], "health": updater.health(),
+                          "hosts": len(store.hosts), "ip": st["ip"],
                           "ip_error": st["ip_error"], "last_run": st["last_run"], "error": st["error"]}}
     try:
         out["cloudflare"] = {"ok": True, **await cf.verify()}
@@ -282,7 +354,8 @@ def _ddns_view() -> dict:
         "settings": {k: snap[k] for k in ("enabled", "interval", "ipv4", "ipv6")},
         "state": {"ip": st["ip"], "ip_error": st["ip_error"], "ip_source": st["ip_source"],
                   "last_run": st["last_run"], "next_run": st["next_run"], "running": st["running"],
-                  "error": st["error"]},
+                  "error": st["error"], "health": updater.health(), "loop_error": st["loop_error"]},
+        "log": st["log"][:20],
         "hosts": [{"name": n, **h, "status": st["hosts"].get(n)} for n, h in sorted(snap["hosts"].items())],
         "history": snap["history"][:30],
         "notify": bool(settings.notify_url),
@@ -292,6 +365,7 @@ def _ddns_view() -> dict:
 
 @app.get("/api/ddns")
 async def ddns_get(_s: Session = Depends(require_session)):
+    updater.ensure_running()
     view = _ddns_view()
     try:
         by_name: dict[str, list[dict]] = {}
@@ -393,12 +467,21 @@ async def ddns_remove(body: HostDeleteIn, request: Request, s: Session = Depends
     return {"ok": True, "deleted": deleted}
 
 
+@app.post("/api/ddns/diagnose")
+async def ddns_diagnose(request: Request, s: Session = Depends(require_session)):
+    audit.log("ddns_diagnose", client_ip(request), user=s.user)
+    return await updater.diagnose()
+
+
 @app.post("/api/ddns/run")
 async def ddns_run(request: Request, s: Session = Depends(require_session)):
     if updater.state["running"]:
         raise HTTPException(409, "Läuft bereits")
     audit.log("ddns_run_manual", client_ip(request), user=s.user)
-    await updater.run_once("manual")
+    try:
+        await updater.run_once("manual")
+    except Exception as exc:  # noqa: BLE001 – recorded in the run log shown to the user
+        print(f"manual ddns run failed: {exc!r}", flush=True)
     return _ddns_view()
 
 
