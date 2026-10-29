@@ -18,6 +18,11 @@ services:
       TOTP_SECRET_FILE: /run/secrets/totp_secret
       CF_API_TOKEN_FILE: /run/secrets/cf_api_token
       NOTIFY_URL: ${NOTIFY_URL:-}
+      TZ: ${TZ:-Europe/Berlin}
+      NPM_URL: ${NPM_URL:-}
+      NPM_EMAIL: ${NPM_EMAIL:-}
+      NPM_PASSWORD_FILE: /run/secrets/npm_password
+      NPM_VERIFY_TLS: ${NPM_VERIFY_TLS:-true}
       OLLAMA_URL: ${OLLAMA_URL:?OLLAMA_URL in .env setzen}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
       OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-8192}
@@ -33,7 +38,7 @@ services:
       TRUSTED_PROXIES: ${TRUSTED_PROXIES:-}
       SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-30}
       SESSION_MAX_HOURS: ${SESSION_MAX_HOURS:-8}
-    secrets: [admin_password_hash, totp_secret, cf_api_token]
+    secrets: [admin_password_hash, totp_secret, cf_api_token, npm_password]
     volumes:
       - dm-data:/data
       # Optional, read-only: your old favonia/CloudflareDNS folder for the one-time import.
@@ -63,6 +68,8 @@ secrets:
     file: ./secrets/totp_secret
   cf_api_token:
     file: ./secrets/cf_api_token
+  npm_password:
+    file: ./secrets/npm_password
 
 volumes:
   dm-data:

@@ -30,6 +30,8 @@ const ICONS = {
   trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   logout: '<path d="M9 21H5V3h4M16 17l5-5-5-5M21 12H9"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
 };
 function icon(name) {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -164,7 +166,9 @@ const NAV = [
   ["overview", "Übersicht", "home"],
   ["dns", "DNS-Einträge", "dns"],
   ["ddns", "DDNS", "ddns"],
+  ["usage", "NPM-Abgleich", "link"],
   ["scan", "Sicherheitscheck", "shield"],
+  ["schedule", "Wochen-Scan", "clock"],
   ["audit", "Audit-Log", "list"],
 ];
 
@@ -204,7 +208,7 @@ function renderView() {
   const page = document.getElementById("page");
   if (!page) return;
   put(page, loading());
-  const views = { overview: viewOverview, dns: viewDns, ddns: viewDdns, scan: viewScan, audit: viewAudit };
+  const views = { overview: viewOverview, dns: viewDns, ddns: viewDdns, usage: viewUsage, scan: viewScan, schedule: viewSchedule, audit: viewAudit };
   (views[state.view] || viewOverview)(page).catch((e) => { if (e.message !== "401") put(page, errorBox(e)); });
 }
 
@@ -228,7 +232,12 @@ async function viewOverview(page) {
       ol.ok ? (ol.default_available ? `Standard: ${ol.default_model}` : `Standardmodell ${ol.default_model} fehlt`) : `${ol.url} – ${ol.error}`),
     stat("DDNS-Updater", !dd.enabled ? "warn" : dd.error ? "bad" : "ok",
       !dd.enabled ? "Pausiert" : dd.error ? "Fehler" : `${dd.hosts} Hosts aktuell`,
-      [dd.error, ipText || "Öffentliche IP noch nicht ermittelt", dd.last_run ? `Letzter Lauf ${fmtTime(dd.last_run)}` : null].filter(Boolean).join(" · ")));
+      [dd.error, ipText || "Öffentliche IP noch nicht ermittelt", dd.last_run ? `Letzter Lauf ${fmtTime(dd.last_run)}` : null].filter(Boolean).join(" · ")),
+    stat("Nginx Proxy Manager", !st.npm.configured ? "warn" : st.npm.error ? "bad" : st.npm.unused ? "warn" : "ok",
+      !st.npm.configured ? "Nicht verbunden" : st.npm.error ? "Fehler" : st.npm.unused ? `${st.npm.unused} ungenutzte Subdomains` : "Alles genutzt",
+      !st.npm.configured ? "NPM_URL in .env setzen" : st.npm.error || (st.npm.generated ? `${st.npm.hosts} Hosts · Stand ${fmtTime(st.npm.generated)}` : "Noch nicht geprüft")),
+    stat("Wochen-Scan", st.schedule.enabled ? "ok" : "warn", st.schedule.enabled ? `${st.schedule.tested} Hosts geprüft` : "Aus",
+      st.schedule.summary_score != null ? `Letzter Durchgang: Score ${st.schedule.summary_score}/100` : "Noch kein vollständiger Durchgang"));
 
   const zoneCard = h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Domains"), h("span", { class: "sub" }, "Zonen in deinem Cloudflare-Konto")));
   put(page, pageHead("Übersicht", "Status aller angebundenen Dienste und deine Cloudflare-Zonen.",
@@ -687,6 +696,193 @@ function renderScanResult(job, box) {
     h("div", { class: "card" },
       h("div", { class: "card-head" }, h("h2", {}, "Befunde"), h("div", { class: "right" }, filterSel)),
       h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Schwere"), h("th", {}, "Host"), h("th", {}, "Befund"), h("th", {}, "Prüfung"))), tbody))));
+}
+
+// ------------------------------------------------------------------ usage (NPM)
+const USAGE_ORDER = ["unused", "backend_down", "disabled", "dead_host", "unknown", "used", "external"];
+const USAGE_BADGE = { unused: "sev-high", backend_down: "sev-high", disabled: "sev-medium", dead_host: "sev-medium", unknown: "sev-info", used: "sev-ok", external: "sev-info" };
+const USAGE_SHORT = { unused: "Ungenutzt", backend_down: "Backend offline", disabled: "Deaktiviert", dead_host: "404-Host", unknown: "Unbekannt", used: "Genutzt", external: "Extern" };
+
+async function viewUsage(page) {
+  const d = await api("/api/usage");
+  const reload = () => viewUsage(page).catch((e) => toast(e.message, "error"));
+  const refreshBtn = h("button", { class: "btn", disabled: !d.configured }, icon("refresh"), "Jetzt prüfen");
+  refreshBtn.addEventListener("click", async () => {
+    refreshBtn.disabled = true;
+    refreshBtn.replaceChildren(icon("refresh"), "Prüfe…");
+    try { await api("/api/usage/refresh", { method: "POST" }); toast("Abgleich aktualisiert", "ok"); } catch (e) { toast(e.message, "error"); }
+    reload();
+  });
+  const head = pageHead("Ungenutzte Subdomains",
+    "Abgleich deiner Cloudflare-Subdomains mit Nginx Proxy Manager: Was auf dein Netz zeigt, aber keinen (aktiven) Proxy-Host oder kein erreichbares Backend hat, wird gemeldet. Läuft automatisch alle 6 Stunden, neue Funde kommen per Benachrichtigung.",
+    refreshBtn);
+  if (!d.configured) {
+    put(page, head, h("div", { class: "alert info" }, h("div", {}, h("b", {}, "Nginx Proxy Manager nicht verbunden"),
+      "In .env ", h("code", {}, "NPM_URL"), " und ", h("code", {}, "NPM_EMAIL"), " setzen, das Passwort in ", h("code", {}, "secrets/npm_password"),
+      " ablegen und neu starten. Am besten einen eigenen NPM-Benutzer mit Rechten „View only“ anlegen.")));
+    return;
+  }
+  const rep = d.report;
+  const ignored = new Set(d.ignored);
+  let filter = "problems";
+  const tbody = h("tbody");
+  const chips = h("div", { class: "pill-row" });
+
+  function draw() {
+    const rows = rep.hosts.filter((x) => filter === "all" ? true : filter === "problems"
+      ? ["unused", "backend_down", "disabled", "dead_host"].includes(x.status) && !ignored.has(x.name)
+      : filter === "ignored" ? ignored.has(x.name) : x.status === filter)
+      .sort((a, b) => USAGE_ORDER.indexOf(a.status) - USAGE_ORDER.indexOf(b.status) || a.name.localeCompare(b.name));
+    tbody.replaceChildren(...(rows.length ? rows.map((x) => {
+      const isIgn = ignored.has(x.name);
+      return h("tr", { class: isIgn ? "muted" : "" },
+        h("td", { class: "name" }, x.name, x.ddns ? [" ", h("span", { class: "badge ddns" }, "DDNS")] : null),
+        h("td", {}, h("span", { class: "badge " + USAGE_BADGE[x.status], title: d.labels[x.status] || "" }, USAGE_SHORT[x.status] || x.status)),
+        h("td", { class: "content small", title: x.records.map((r) => `${r.type} ${r.content}`).join(", ") },
+          x.records.map((r) => `${r.type} ${r.content}`).join(", "), " ", cloud(x.records.every((r) => r.proxied))),
+        h("td", { class: "small" }, x.npm.length ? x.npm.map((n) => h("div", {},
+          h("span", { class: "badge type" }, { proxy: "Proxy", redirect: "Redirect", dead: "404" }[n.kind]), " ", n.target,
+          !n.enabled ? [" ", h("span", { class: "badge sev-medium" }, "aus")] : null,
+          n.alive === false ? [" ", h("span", { class: "badge sev-high" }, "offline")] : null,
+          n.ssl ? [" ", h("span", { class: "badge sev-ok" }, "SSL")] : null,
+          n.access_list ? [" ", h("span", { class: "badge sev-low" }, "Access-List")] : null))
+          : h("span", { class: "muted" }, "kein NPM-Host")),
+        h("td", { class: "actions" },
+          h("button", { class: "btn sm link", onclick: () => { state.scanHosts.add(x.name); toast(`${x.name} zum Sicherheitscheck hinzugefügt`, "ok"); } }, "Prüfen"),
+          h("button", { class: "btn sm", onclick: async () => {
+            try { await api("/api/usage/ignore", { method: "PUT", body: { name: x.name, ignored: !isIgn } }); isIgn ? ignored.delete(x.name) : ignored.add(x.name); draw(); drawChips(); }
+            catch (e) { toast(e.message, "error"); }
+          } }, isIgn ? "Nicht mehr ignorieren" : "Ignorieren"),
+          state.session.allow_dns_delete ? [" ", h("button", { class: "btn sm danger", title: "DNS-Record löschen", onclick: () => {
+            const r = x.records[0];
+            confirmDeleteRecord({ id: r.zone_id }, { ...r, name: x.name, in_ddns: x.ddns }, () => api("/api/usage/refresh", { method: "POST" }).then(reload, reload));
+          } }, icon("trash"))] : null));
+    }) : [h("tr", {}, h("td", { colspan: "5", class: "empty" }, filter === "problems" ? "Keine ungenutzten Subdomains 🎉" : "Keine Einträge."))]));
+  }
+  function drawChips() {
+    const problems = rep.hosts.filter((x) => ["unused", "backend_down", "disabled", "dead_host"].includes(x.status) && !ignored.has(x.name)).length;
+    const opts = [["problems", `Probleme (${problems})`], ...USAGE_ORDER.filter((k) => rep.counts[k]).map((k) => [k, `${USAGE_SHORT[k]} (${rep.counts[k]})`]),
+      ["ignored", `Ignoriert (${ignored.size})`], ["all", `Alle (${rep.hosts.length})`]];
+    chips.replaceChildren(...opts.map(([k, label]) => h("button", { class: "chip-btn" + (filter === k ? " active" : ""), onclick: () => { filter = k; draw(); drawChips(); } }, label)));
+  }
+  drawChips(); draw();
+
+  put(page, head,
+    rep.npm_error ? h("div", { class: "alert error" }, h("div", {}, h("b", {}, "NPM-Fehler"), rep.npm_error)) : null,
+    h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "Subdomains"), h("span", { class: "sub" }, `${rep.npm_hosts} NPM-Hosts · Stand ${fmtTime(rep.generated)}`)),
+      h("div", { class: "card-body tight" }, chips),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Hostname"), h("th", {}, "Status"), h("th", {}, "DNS"), h("th", {}, "Nginx Proxy Manager"), h("th", {}))), tbody))),
+    rep.npm_orphans.length ? h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "NPM-Hosts ohne DNS-Eintrag"), h("span", { class: "sub" }, "In NPM konfiguriert, aber bei Cloudflare gibt es keinen Record – evtl. Altlast")),
+      h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Domain"), h("th", {}, "Typ"), h("th", {}, "Ziel"))),
+        h("tbody", {}, rep.npm_orphans.map((o) => h("tr", {}, h("td", { class: "name" }, o.domain, !o.enabled ? [" ", h("span", { class: "badge sev-medium" }, "aus")] : null),
+          h("td", {}, { proxy: "Proxy", redirect: "Redirect", dead: "404" }[o.kind]), h("td", { class: "content" }, o.target))))))) : null);
+}
+
+// ------------------------------------------------------------------ scheduled scan
+async function viewSchedule(page) {
+  const [d, modelsRes] = await Promise.all([api("/api/schedule"), api("/api/ollama/models").catch(() => ({ models: [], default: "" }))]);
+  const s = d.settings;
+  const reload = () => viewSchedule(page).catch((e) => toast(e.message, "error"));
+  async function save(patch) {
+    try { await api("/api/schedule/settings", { method: "PUT", body: { ...s, ...patch } }); toast("Gespeichert", "ok"); } catch (e) { toast(e.message, "error"); }
+    reload();
+  }
+  const sel = (value, options, key, fmt) => h("select", { onchange: (e) => save({ [key]: Number(e.target.value) }) },
+    options.map((o) => h("option", { value: o, selected: o === value }, fmt(o))));
+  const hours = [...Array(25).keys()];
+  const usable = (modelsRes.models || []).filter((m) => m.usable);
+  const modelSel = h("select", { disabled: !s.ai, onchange: (e) => save({ model: e.target.value }) },
+    h("option", { value: "", selected: !s.model }, `Standard (${modelsRes.default || "–"})`),
+    usable.map((m) => h("option", { value: m.name, selected: m.name === s.model }, `${m.name} · ${m.size_gb} GB`)));
+
+  const p = d.plan || { total: 0, tested: 0, batch: [], runs_left: 0 };
+  const pct = p.total ? Math.round((100 * p.tested) / p.total) : 0;
+  const bar = h("div", { class: "progress" }, h("div"));
+  bar.firstChild.style.width = pct + "%";
+  const runBtn = h("button", { class: "btn", disabled: d.running }, icon("refresh"), d.running ? "Läuft…" : "Nächsten Block jetzt prüfen");
+  runBtn.addEventListener("click", async () => {
+    try { await api("/api/schedule/run", { method: "POST" }); toast("Block gestartet", "ok"); } catch (e) { toast(e.message, "error"); }
+    setTimeout(reload, 800);
+  });
+  if (d.running) state.pollTimer = setTimeout(reload, 3000);
+
+  const settingsCard = h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("h2", {}, "Automatischer Sicherheitscheck"),
+      h("span", { class: "badge " + (s.enabled ? "sev-ok" : "sev-medium") }, s.enabled ? "Aktiv" : "Aus"),
+      h("div", { class: "right" }, toggle(s.enabled, (v) => save({ enabled: v }), s.enabled ? "Ein" : "Aus"), runBtn)),
+    h("div", { class: "card-body settings-grid" },
+      h("label", {}, h("span", {}, "Alle Hosts prüfen innerhalb von"), sel(s.period_days, [1, 2, 3, 7, 14, 30], "period_days", (v) => v === 1 ? "1 Tag" : `${v} Tagen`)),
+      h("label", {}, h("span", {}, "Ein Block alle"), sel(s.interval_hours, [1, 2, 3, 4, 6, 8, 12, 24], "interval_hours", (v) => `${v} h`)),
+      h("label", {}, h("span", {}, `Zeitfenster (${d.timezone})`), h("div", { class: "toolbar" },
+        sel(s.window_start, hours.slice(0, 24), "window_start", (v) => `${String(v).padStart(2, "0")}:00`), "–",
+        sel(s.window_end, hours.slice(1), "window_end", (v) => `${String(v).padStart(2, "0")}:00`))),
+      h("label", {}, h("span", {}, "KI-Zusammenfassung am Ende"), h("div", { class: "toolbar" }, toggle(s.ai, (v) => save({ ai: v })), modelSel)),
+      h("label", {}, h("span", {}, "Benachrichtigen"), toggle(s.notify, (v) => save({ notify: v }), "neue hohe Befunde + Abschluss"))),
+    h("div", { class: "card-foot" },
+      h("div", { class: "cycle" },
+        h("div", { class: "toolbar" }, h("b", {}, `${p.tested} von ${p.total} Hosts geprüft`),
+          h("span", { class: "muted small" }, d.cycle.completed ? `· Durchgang fertig am ${fmtTime(d.cycle.completed)}, nächster startet ${fmtTime(p.cycle_ends)}`
+            : d.cycle.started ? `· Durchgang endet ${fmtTime(p.cycle_ends)} · nächster Block: ${p.batch.length} Host(s), noch ca. ${p.runs_left} Läufe` : "· noch nicht gestartet"),
+          h("span", { class: "spacer" }),
+          h("button", { class: "btn sm link", onclick: async () => { await api("/api/schedule/reset", { method: "POST" }); toast("Durchgang neu gestartet", "ok"); reload(); } }, "Durchgang neu starten")),
+        bar,
+        h("div", { class: "small muted" },
+          d.running && d.progress ? `Prüfe gerade: ${d.progress.hosts.join(", ")} (${d.progress.done}/${d.progress.total})`
+            : [`Letzter Block: ${d.last_run ? fmtTime(d.last_run) : "–"}`, d.last_batch.length ? ` (${d.last_batch.join(", ")})` : "",
+              s.enabled && d.next_run ? ` · Nächster: ${fmtTime(Math.max(d.next_run, Date.now() / 1000))}` : ""].join("")),
+        d.last_error ? h("div", { class: "alert error small" }, d.last_error) : null)));
+
+  let summaryCard = null;
+  if (d.summary) {
+    const sm = d.summary, a = sm.ai;
+    summaryCard = h("div", { class: "card" },
+      h("div", { class: "card-head" }, h("h2", {}, "Letzter vollständiger Durchgang"), h("span", { class: "sub" }, `${fmtTime(sm.ts)} · ${sm.hosts} Hosts · Score ${sm.score}/100`),
+        a ? h("span", { class: "badge sev-" + ({ niedrig: "low", mittel: "medium", hoch: "high", kritisch: "critical" }[a.risiko] || "info") }, "Risiko: " + a.risiko) : null),
+      a ? [h("div", { class: "card-body" }, h("p", {}, a.zusammenfassung)),
+        a.massnahmen.length ? h("ol", { class: "steps" }, a.massnahmen.map((m) => h("li", {}, h("div", { class: "t" }, m.titel), h("div", { class: "b" }, m.betrifft), h("div", { class: "d" }, m.schritte)))) : null]
+        : h("div", { class: "card-body" }, sm.ai_error ? h("div", { class: "alert warn" }, sm.ai_error) : h("span", { class: "muted" }, "Ohne KI-Zusammenfassung.")));
+  }
+
+  const rows = d.hosts.map((x) => {
+    const c = x.counts || {};
+    return h("tr", { class: x.excluded ? "muted" : "" },
+      h("td", { class: "name" }, x.name, x.excluded ? [" ", h("span", { class: "badge sev-info" }, "ausgeschlossen")] : null),
+      h("td", { class: "nowrap small" }, x.ts ? fmtAgo(x.ts) : h("span", { class: "muted" }, "noch nie"), x.tested_this_cycle ? [" ", h("span", { class: "badge sev-ok" }, "✓")] : null),
+      h("td", {}, x.score === null || x.score === undefined ? "–" : h("span", { class: "badge " + (x.score >= 80 ? "sev-ok" : x.score >= 50 ? "sev-medium" : "sev-high") }, x.score)),
+      h("td", {}, h("div", { class: "pill-row" }, ["critical", "high", "medium", "low"].filter((k) => c[k]).map((k) => h("span", { class: "badge sev-" + k }, `${c[k]} ${SEV_LABEL[k]}`)))),
+      h("td", { class: "actions" },
+        x.ts ? h("button", { class: "btn sm link", onclick: () => showHostFindings(x.name) }, "Details") : null,
+        h("button", { class: "btn sm", onclick: async () => {
+          try { await api("/api/schedule/exclude", { method: "PUT", body: { name: x.name, excluded: !x.excluded } }); reload(); } catch (e) { toast(e.message, "error"); }
+        } }, x.excluded ? "Einschließen" : "Ausschließen")));
+  });
+  const zoneRows = Object.entries(d.zones).flatMap(([z, v]) => v.findings.filter((f) => !["ok", "info"].includes(f.severity)).map((f) =>
+    h("tr", {}, h("td", {}, sevBadge(f.severity)), h("td", { class: "name" }, z), h("td", {}, h("b", {}, f.title), f.detail ? h("div", { class: "muted small" }, f.detail) : null))));
+
+  put(page,
+    pageHead("Wochen-Scan", "Prüft automatisch in kleinen Blöcken, bis alle Subdomains im gewählten Zeitraum getestet sind – schont Netz und GPU. Danach beginnt der nächste Durchgang. Manuelle Scans zählen mit."),
+    settingsCard, summaryCard,
+    zoneRows.length ? h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Zonen-Befunde"), h("span", { class: "sub" }, "SSL-Modus, E-Mail-Schutz, DNSSEC …")),
+      h("div", { class: "table-wrap" }, h("table", {}, h("tbody", {}, zoneRows)))) : null,
+    h("div", { class: "card" }, h("div", { class: "card-head" }, h("h2", {}, "Ergebnisse je Host"), h("span", { class: "sub" }, `${d.hosts.length} Hosts`)),
+      h("div", { class: "table-wrap" }, h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Hostname"), h("th", {}, "Zuletzt geprüft"), h("th", {}, "Score"), h("th", {}, "Befunde"), h("th", {}))),
+        h("tbody", {}, rows.length ? rows : h("tr", {}, h("td", { colspan: "5", class: "empty" }, "Keine Hosts.")))))));
+}
+
+async function showHostFindings(name) {
+  try {
+    const r = await api(`/api/schedule/host?name=${encodeURIComponent(name)}`);
+    const list = r.findings.filter((f) => f.severity !== "info");
+    modal({ title: `${name} · Score ${r.score}`, wide: true, confirmText: "Schließen", onConfirm: () => true,
+      body: [h("p", { class: "muted small" }, `Geprüft ${fmtTime(r.ts)}`),
+        h("div", { class: "table-wrap import-table" }, h("table", {}, h("tbody", {}, list.length ? list.map((f) => h("tr", {}, h("td", {}, sevBadge(f.severity)),
+          h("td", {}, h("b", {}, f.title), f.detail ? h("div", { class: "muted small" }, f.detail) : null), h("td", { class: "muted small" }, f.check)))
+          : h("tr", {}, h("td", { class: "empty" }, "Keine Befunde.")))))] });
+  } catch (e) { toast(e.message, "error"); }
 }
 
 // ------------------------------------------------------------------ audit

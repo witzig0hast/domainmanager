@@ -15,11 +15,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import audit, importer, ollama
+from . import audit, importer, ollama, usage
 from .auth import SESSION_COOKIE, Session, limiter, sessions, verify_credentials
 from .cloudflare import CloudflareError, cf, valid_id
 from .config import settings
 from .scanner import run_scan
+from .npm import npm
+from .scheduler import plan, scannable_hosts, scheduler
+from .scheduler import store as sched_store
 from .updater import TTL_CHOICES, UpdaterError, host_entry, normalize, store, updater
 
 STATIC = Path(__file__).parent / "static"
@@ -46,7 +49,9 @@ async def lifespan(_app: FastAPI):
     if not settings.admin_password_hash:
         print("WARNUNG: Kein ADMIN_PASSWORD_HASH gesetzt – Login ist deaktiviert.", flush=True)
     updater.start()
+    scheduler.start()
     yield
+    await scheduler.stop()
     await updater.stop()
     await cf.close()
 
@@ -183,6 +188,14 @@ async def status(_s: Session = Depends(require_session)):
         out["cloudflare"] = {"ok": True, **await cf.verify()}
     except CloudflareError as exc:
         out["cloudflare"] = {"ok": False, "error": str(exc)}
+    report = usage.state.data["report"] or {}
+    out["npm"] = {"configured": npm.configured, "error": report.get("npm_error"),
+                  "hosts": report.get("npm_hosts"), "generated": report.get("generated"),
+                  "unused": sum(v for k, v in (report.get("counts") or {}).items() if usage.STATUS.get(k, ("", False))[1])}
+    sc = sched_store.data
+    out["schedule"] = {"enabled": sc["settings"]["enabled"], "tested": len(sc["cycle"]["tested"]),
+                       "last_run": sc["last_run"], "next_run": scheduler.next_run(),
+                       "summary_score": (sc["summary"] or {}).get("score")}
     try:
         models = await ollama.models()
         out["ollama"] = {"ok": True, "url": settings.ollama_url, "models": len(models),
@@ -491,6 +504,8 @@ async def _run_job(job: dict, hosts: list[str], model: str, use_ai: bool) -> Non
     try:
         job["phase"] = "checks"
         job["result"] = await run_scan(hosts, progress)
+        await scheduler._store_results(hosts, job["result"])  # manual results count for the weekly cycle too
+        await asyncio.to_thread(sched_store.save)
         if use_ai:
             job["phase"] = "ai"
             try:
@@ -553,6 +568,143 @@ async def scan_list(_s: Session = Depends(require_session)):
           "hosts": len((j.get("result") or {}).get("hosts", [])),
           "score": (j.get("result") or {}).get("score")} for j in _jobs.values()),
         key=lambda j: -j["started"])
+
+
+# ---------------------------------------------------------------- npm usage
+
+@app.get("/api/usage")
+async def usage_get(_s: Session = Depends(require_session)):
+    if usage.state.data["report"] is None and npm.configured:
+        await usage.refresh(notify_new=False)
+    return {"configured": npm.configured, "report": usage.state.data["report"],
+            "ignored": usage.state.data["ignored"], "labels": {k: v[0] for k, v in usage.STATUS.items()}}
+
+
+@app.post("/api/usage/refresh")
+async def usage_refresh(request: Request, s: Session = Depends(require_session)):
+    if not npm.configured:
+        raise HTTPException(400, "Nginx Proxy Manager ist nicht konfiguriert")
+    audit.log("usage_refresh", client_ip(request), user=s.user)
+    await usage.refresh(notify_new=False)
+    return await usage_get(s)
+
+
+class IgnoreIn(BaseModel):
+    name: str = Field(max_length=253)
+    ignored: bool
+
+
+@app.put("/api/usage/ignore")
+async def usage_ignore(body: IgnoreIn, request: Request, s: Session = Depends(require_session)):
+    name = normalize(body.name)
+    ignored = set(usage.state.data["ignored"])
+    ignored.add(name) if body.ignored else ignored.discard(name)
+    usage.state.data["ignored"] = sorted(ignored)
+    await asyncio.to_thread(usage.state.save)
+    audit.log("usage_ignore", client_ip(request), user=s.user, name=name, ignored=body.ignored)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- scheduled scan
+
+async def _schedule_view() -> dict:
+    d = sched_store.snapshot()
+    try:
+        hosts = await scannable_hosts()
+        p = plan(hosts)
+        cf_error = None
+    except CloudflareError as exc:
+        hosts, p, cf_error = [], None, str(exc)
+    all_names = sorted(set(hosts) | set(d["excluded"]) | set(d["results"]))
+    rows = []
+    for name in all_names:
+        r = d["results"].get(name) or {}
+        rows.append({"name": name, "ts": r.get("ts"), "score": r.get("score"), "counts": r.get("counts"),
+                     "excluded": name in d["excluded"], "tested_this_cycle": name in d["cycle"]["tested"]})
+    return {
+        "settings": d["settings"], "cycle": {**d["cycle"], "tested": len(d["cycle"]["tested"])},
+        "plan": {k: p[k] for k in ("total", "tested", "batch", "runs_left", "cycle_ends")} if p else None,
+        "next_run": scheduler.next_run(), "running": scheduler.running, "progress": scheduler.progress,
+        "last_run": d["last_run"], "last_batch": d["last_batch"], "last_error": d["last_error"] or cf_error,
+        "summary": d["summary"], "hosts": rows,
+        "zones": {z: {"ts": v["ts"], "findings": v["findings"]} for z, v in d["zones"].items()},
+        "timezone": settings.timezone,
+    }
+
+
+@app.get("/api/schedule")
+async def schedule_get(_s: Session = Depends(require_session)):
+    return await _schedule_view()
+
+
+class ScheduleIn(BaseModel):
+    enabled: bool
+    period_days: int = Field(ge=1, le=60)
+    interval_hours: int = Field(ge=1, le=48)
+    window_start: int = Field(ge=0, le=23)
+    window_end: int = Field(ge=1, le=24)
+    ai: bool
+    model: str = Field(default="", max_length=100)
+    notify: bool
+
+
+@app.put("/api/schedule/settings")
+async def schedule_settings(body: ScheduleIn, request: Request, s: Session = Depends(require_session)):
+    if body.ai and body.model:
+        available = {m["name"]: m for m in await ollama.models()}
+        if body.model not in available or not available[body.model]["usable"]:
+            raise HTTPException(400, "Modell nicht verfügbar oder zu groß")
+    sched_store.data["settings"].update(body.model_dump())
+    await asyncio.to_thread(sched_store.save)
+    audit.log("schedule_settings", client_ip(request), user=s.user, settings=body.model_dump())
+    scheduler.trigger()
+    return await _schedule_view()
+
+
+_bg: set[asyncio.Task] = set()
+
+
+@app.post("/api/schedule/run")
+async def schedule_run(request: Request, s: Session = Depends(require_session)):
+    if scheduler.running:
+        raise HTTPException(409, "Läuft bereits")
+    audit.log("schedule_run_manual", client_ip(request), user=s.user)
+    task = asyncio.create_task(scheduler.run_batch("manual"))
+    _bg.add(task)
+    task.add_done_callback(_bg.discard)
+    return {"ok": True}
+
+
+@app.post("/api/schedule/reset")
+async def schedule_reset(request: Request, s: Session = Depends(require_session)):
+    sched_store.data["cycle"] = {"started": None, "tested": {}, "completed": None}
+    await asyncio.to_thread(sched_store.save)
+    audit.log("schedule_reset", client_ip(request), user=s.user)
+    return await _schedule_view()
+
+
+class ExcludeIn(BaseModel):
+    name: str = Field(max_length=253)
+    excluded: bool
+
+
+@app.put("/api/schedule/exclude")
+async def schedule_exclude(body: ExcludeIn, request: Request, s: Session = Depends(require_session)):
+    name = normalize(body.name)
+    ex = set(sched_store.data["excluded"])
+    ex.add(name) if body.excluded else ex.discard(name)
+    sched_store.data["excluded"] = sorted(ex)
+    await asyncio.to_thread(sched_store.save)
+    audit.log("schedule_exclude", client_ip(request), user=s.user, name=name, excluded=body.excluded)
+    return {"ok": True}
+
+
+@app.get("/api/schedule/host")
+async def schedule_host(name: str, _s: Session = Depends(require_session)):
+    r = sched_store.data["results"].get(normalize(name))
+    if r is None:
+        raise HTTPException(404, "Noch nicht geprüft")
+    return r
 
 
 # ---------------------------------------------------------------- audit + static

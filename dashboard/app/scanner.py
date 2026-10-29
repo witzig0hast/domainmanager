@@ -193,6 +193,8 @@ def _zone_checks(zone: dict, records: list[dict], zs: dict | None, dnssec: str |
         out.append(_f(z, "email", "ok", "DMARC aktiv", dmarc[0][:120]))
     if not any(r["type"] == "CAA" for r in records):
         out.append(_f(z, "dns", "low", "Kein CAA-Record", "Legt fest, welche CAs Zertifikate ausstellen dürfen."))
+    for f in out:
+        f["zone"] = True  # zone-wide finding, not tied to the apex host itself
     return out
 
 
@@ -228,8 +230,17 @@ def score(findings: list[dict]) -> int:
     return max(0, 100 - sum(_WEIGHT.get(f["severity"], 0) for f in findings))
 
 
+# Manual and scheduled scans share the network and the GPU, so they run one after another.
+_scan_lock = asyncio.Lock()
+
+
 async def run_scan(hosts: list[str], progress) -> dict:
     """hosts: hostnames that exist as records in the account (validated by caller)."""
+    async with _scan_lock:
+        return await _run_scan(hosts, progress)
+
+
+async def _run_scan(hosts: list[str], progress) -> dict:
     started = time.time()
     all_records = await cf.all_records()
     zones = {z["id"]: z for z in await cf.zones()}

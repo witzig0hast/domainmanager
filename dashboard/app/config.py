@@ -67,6 +67,12 @@ class Settings:
     import_dir: Path = field(default_factory=lambda: Path(_env("IMPORT_DIR", "/import")))
     notify_url: str = field(default_factory=lambda: _secret("NOTIFY_URL"))
 
+    npm_url: str = field(default_factory=lambda: _env("NPM_URL").rstrip("/"))
+    npm_email: str = field(default_factory=lambda: _env("NPM_EMAIL"))
+    npm_password: str = field(default_factory=lambda: _secret("NPM_PASSWORD"))
+    npm_verify_tls: bool = field(default_factory=lambda: _bool("NPM_VERIFY_TLS", True))
+    timezone: str = field(default_factory=lambda: _env("TZ", "Europe/Berlin"))
+
     allow_dns_delete: bool = field(default_factory=lambda: _bool("ALLOW_DNS_DELETE", False))
     allowed_networks: list = field(default_factory=lambda: _networks(_env("ALLOWED_NETWORKS", DEFAULT_ALLOWED)))
 

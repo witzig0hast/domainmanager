@@ -6,6 +6,8 @@ Selbst gehostetes Dashboard im Cloudflare-Look für dein Homelab – **ein einzi
 - **Import** deiner bisherigen favonia-Subdomains (aus dem Compose-Ordner, per Einfügen oder als Vorschlag aus Cloudflare)
 - **DNS-Einträge** aller Zonen ansehen, Proxy per Klick auf die Wolke umschalten, optional löschen
 - **Sicherheitscheck** deiner Domains mit Zusammenfassung durch dein **lokales Ollama-Modell**
+- **Wochen-Scan**: prüft automatisch in kleinen Blöcken, bis alle Subdomains im eingestellten Zeitraum (z. B. 7 Tage) getestet sind – optional nur nachts
+- **Nginx Proxy Manager anbinden**: meldet ungenutzte Subdomains (kein Proxy-Host, Host deaktiviert, Backend offline, nur 404-Host) und NPM-Hosts ohne DNS-Eintrag
 - **IP-Verlauf**, optionale **Push-Benachrichtigung** bei IP-Wechsel (ntfy, Discord), **Audit-Log**
 
 ```
@@ -13,6 +15,7 @@ Selbst gehostetes Dashboard im Cloudflare-Look für dein Homelab – **ein einzi
                       ├─▶ 1.1.1.1/cdn-cgi/trace   öffentliche IP ermitteln (Fallback: ipify)
                       ├─▶ api.cloudflare.com      Records anlegen/korrigieren (API-Token)
                       ├─▶ Ollama im LAN           Sicherheits-Zusammenfassung
+                      ├─▶ Nginx Proxy Manager     Proxy-Hosts lesen (nur lesend), Backends per TCP prüfen
                       └─▶ deine Hosts             TLS-/HTTP-Checks
 ```
 
@@ -65,7 +68,7 @@ Cloudflare → *My Profile → API Tokens → Create Token → Custom token*:
 git clone https://github.com/witzig0hast/domainmanager.git && cd domainmanager
 cp .env.example .env && nano .env        # OLLAMA_URL, BIND_ADDR, TLS_HOSTNAMES, DDNS_IMPORT_DIR …
 
-touch secrets/admin_password_hash secrets/totp_secret
+touch secrets/admin_password_hash secrets/totp_secret secrets/npm_password
 printf '%s' 'DEIN_CLOUDFLARE_TOKEN' > secrets/cf_api_token
 
 docker compose build
@@ -108,6 +111,29 @@ Der Updater startet **pausiert**, damit nichts doppelt läuft:
 ### IPv6 (AAAA-Records)
 
 favonia lief mit `network_mode: host` und hatte daher IPv6. Der DomainManager läuft absichtlich in einem eigenen Netz. Brauchst du AAAA-Records: `DDNS_IPV6=true` in `.env` – das aktiviert IPv6 im Compose-Netz (Docker ≥ 27, der Host braucht eine öffentliche IPv6). Danach in der DDNS-Ansicht prüfen, ob unter „Öffentliche IP“ eine IPv6 erscheint. Ohne IPv6 werden AAAA-Records nicht angefasst; der Status weist auf vorhandene, nicht gepflegte AAAA-Records hin.
+
+## Nginx Proxy Manager anbinden
+
+1. In NPM unter *Users* einen eigenen Benutzer anlegen (z. B. `domainmanager@lan`), **ohne** Admin-Rolle, Berechtigungen: *Proxy Hosts*, *Redirection Hosts*, *404 Hosts* jeweils **View Only**, alles andere *Hidden*. Kein 2FA für diesen Benutzer.
+2. In `.env`: `NPM_URL=http://<npm-ip>:81` und `NPM_EMAIL=domainmanager@lan`; das Passwort in `secrets/npm_password` (danach `chown 10001:10001 secrets/npm_password && chmod 400 secrets/npm_password`).
+3. `docker compose up -d` → Seite **NPM-Abgleich**.
+
+Für jede Subdomain (A/AAAA/CNAME) gibt es einen Status:
+
+| Status | Bedeutung |
+|---|---|
+| **Ungenutzt** | zeigt auf deine Heim-IP (bzw. ist ein DDNS-Host oder CNAME darauf), aber kein NPM-Host ist dafür zuständig |
+| **Backend offline** | NPM-Proxy-Host existiert, aber das Ziel (`forward_host:port`) antwortet nicht per TCP |
+| **Deaktiviert** | nur deaktivierte NPM-Hosts |
+| **404-Host** | in NPM nur als 404-Host eingetragen |
+| **Genutzt** | aktiver Proxy- oder Redirect-Host (auch über NPM-Wildcards wie `*.apps.example.org`) |
+| **Extern** | zeigt nicht auf dein Netz (z. B. Mailanbieter, Vercel) – wird nicht bewertet |
+
+Zusätzlich: **NPM-Hosts ohne DNS-Eintrag** (Altlasten in NPM). Der Abgleich läuft automatisch alle 6 Stunden; neu ungenutzte Subdomains werden einmalig per `NOTIFY_URL` gemeldet. Mit *Ignorieren* blendest du bewusst ungenutzte Einträge aus. Bei aktivem `ALLOW_DNS_DELETE` kannst du den Record direkt löschen.
+
+## Wochen-Scan
+
+Seite **Wochen-Scan**: Zeitraum (z. B. *7 Tage*), Abstand der Blöcke (z. B. *alle 6 h*) und optional ein Zeitfenster (z. B. *01:00–06:00*, Zeitzone `TZ`). Pro Block werden nur so viele Hosts geprüft, dass am Ende des Zeitraums alle getestet sind; die am längsten nicht geprüften kommen zuerst. Fällt etwas aus (Server aus, Zeitfenster zu klein), holt der Scan zum Ende des Zeitraums automatisch auf. Ist ein Durchgang komplett, gibt es eine KI-Zusammenfassung (Modell nur kurz geladen) und eine Benachrichtigung; der nächste Durchgang startet nach Ablauf des Zeitraums. Neue hohe/kritische Befunde werden sofort gemeldet. Einzelne Hosts lassen sich ausschließen; manuelle Scans zählen mit.
 
 ## Bedienung
 
